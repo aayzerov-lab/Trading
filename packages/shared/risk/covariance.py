@@ -208,6 +208,114 @@ def estimate_covariance(
         raise ValueError(f"Unknown covariance estimation method: {method}. Use 'lw' or 'ewma'")
 
 
+def pairwise_cov(
+    returns_dict: dict[str, pd.Series],
+    symbols: list[str],
+    window: int = 252,
+    min_overlap: int = 60,
+    method: str = "lw",
+    ewma_lambda: float = 0.94,
+) -> np.ndarray:
+    """Estimate covariance matrix using pairwise overlapping returns.
+
+    Instead of requiring all symbols to share a single aligned date range,
+    computes each element of the covariance matrix from the overlapping
+    dates available for that pair.  Diagonal entries (variances) use each
+    symbol's own full history (up to *window* observations).
+
+    For off-diagonal entries the pairwise sample covariance is computed,
+    then the full matrix is shrunk toward the diagonal (simple Ledoit-Wolf
+    style constant-correlation shrinkage) so that the result is guaranteed
+    positive semi-definite.
+
+    Args:
+        returns_dict: {symbol: pd.Series} of daily log-returns indexed by date.
+        symbols: ordered list of symbols (defines row/col order of output).
+        window: max number of observations to use per series.
+        min_overlap: minimum overlapping observations required for a pair.
+        method: ignored for now — pairwise always uses sample + shrinkage.
+        ewma_lambda: ignored for now.
+
+    Returns:
+        N x N covariance matrix (numpy array), guaranteed PSD.
+
+    Raises:
+        ValueError: if any symbol is missing or a pair has < min_overlap overlap.
+    """
+    n = len(symbols)
+    if n == 0:
+        raise ValueError("symbols list is empty")
+
+    # Trim each series to last `window` observations
+    trimmed: dict[str, pd.Series] = {}
+    for sym in symbols:
+        if sym not in returns_dict:
+            raise ValueError(f"Symbol {sym} not found in returns_dict")
+        s = returns_dict[sym].dropna()
+        trimmed[sym] = s.iloc[-window:] if len(s) > window else s
+
+    # Build raw pairwise covariance matrix
+    raw_cov = np.zeros((n, n))
+    obs_counts = np.zeros((n, n), dtype=int)
+
+    for i in range(n):
+        si = trimmed[symbols[i]]
+        for j in range(i, n):
+            sj = trimmed[symbols[j]]
+            # Align on common dates
+            common = si.index.intersection(sj.index)
+            overlap = len(common)
+            obs_counts[i, j] = obs_counts[j, i] = overlap
+
+            if overlap < min_overlap:
+                raise ValueError(
+                    f"Pair ({symbols[i]}, {symbols[j]}) has only {overlap} "
+                    f"overlapping observations, need {min_overlap}"
+                )
+
+            ri = si.loc[common].values
+            rj = sj.loc[common].values
+            cov_ij = float(np.cov(ri, rj, ddof=1)[0, 1])
+            raw_cov[i, j] = raw_cov[j, i] = cov_ij
+
+    # PSD correction: pairwise assembly can yield non-PSD matrices.
+    # Use shrinkage toward diagonal (preserves correlation structure
+    # much better than eigenvalue clamping).
+    eigenvalues = np.linalg.eigvalsh(raw_cov)
+    min_eigenvalue = float(np.min(eigenvalues))
+
+    if min_eigenvalue < 1e-10:
+        diag_target = np.diag(np.diag(raw_cov))
+        # Binary search for minimum shrinkage alpha that makes PSD
+        lo, hi = 0.0, 1.0
+        for _ in range(50):
+            mid = (lo + hi) / 2
+            candidate = (1 - mid) * raw_cov + mid * diag_target
+            if np.min(np.linalg.eigvalsh(candidate)) > 1e-10:
+                hi = mid
+            else:
+                lo = mid
+        alpha = hi + 0.01  # small buffer for numerical stability
+        alpha = min(alpha, 1.0)
+        raw_cov = (1 - alpha) * raw_cov + alpha * diag_target
+        raw_cov = (raw_cov + raw_cov.T) / 2
+        logger.info(
+            "pairwise_cov: PSD correction via diagonal shrinkage",
+            min_eigenvalue=min_eigenvalue,
+            shrinkage_alpha=round(alpha, 4),
+        )
+
+    logger.info(
+        "pairwise_cov: covariance estimated",
+        num_assets=n,
+        min_overlap=int(obs_counts[np.triu_indices(n, k=1)].min()) if n > 1 else 0,
+        max_overlap=int(obs_counts[np.triu_indices(n, k=1)].max()) if n > 1 else 0,
+        condition_number=float(np.linalg.cond(raw_cov)),
+    )
+
+    return raw_cov
+
+
 def annualize_cov(cov: np.ndarray, trading_days: int = 252) -> np.ndarray:
     """Annualize a daily covariance matrix.
 

@@ -25,12 +25,16 @@ import {
   ClusterInfo,
   StressTests,
   MacroOverview,
+  DataQualityPack,
+  RiskMetadata,
   fetchRiskSummary,
   fetchRiskContributors,
   fetchCorrelationPairs,
   fetchClusters,
   fetchStressTests,
   fetchMacroOverview,
+  fetchDataQuality,
+  fetchRiskMetadata,
   triggerRiskRecompute,
 } from "@/lib/risk-api";
 import RiskSummaryPanel from "@/components/RiskSummaryPanel";
@@ -39,6 +43,8 @@ import CorrelationPanel from "@/components/CorrelationPanel";
 import ClustersPanel from "@/components/ClustersPanel";
 import StressPanel from "@/components/StressPanel";
 import MacroStrip from "@/components/MacroStrip";
+import DataQualityPanel from "@/components/DataQualityPanel";
+import RiskMetadataPanel from "@/components/RiskMetadataPanel";
 
 // ---------------------------------------------------------------------------
 // Stable color maps – keyed by name so colors never shift between methods
@@ -270,6 +276,8 @@ export default function DashboardPage() {
   const [riskContributors, setRiskContributors] = useState<RiskContributor[]>([]);
   const [correlationPairs, setCorrelationPairs] = useState<CorrelationPair[]>([]);
   const [clusters, setClusters] = useState<ClusterInfo[]>([]);
+  const [dataQuality, setDataQuality] = useState<DataQualityPack | null>(null);
+  const [riskMetadata, setRiskMetadata] = useState<RiskMetadata | null>(null);
   const [riskLoading, setRiskLoading] = useState(false);
 
   // Stress tab state
@@ -361,6 +369,7 @@ export default function DashboardPage() {
   const loadRiskData = useCallback(async () => {
     setRiskLoading(true);
     try {
+      // Core risk fetches (must succeed)
       const [summary, contributors, pairs, clusterData] = await Promise.all([
         fetchRiskSummary(riskWindow, riskMethod),
         fetchRiskContributors(riskWindow, riskMethod),
@@ -373,6 +382,18 @@ export default function DashboardPage() {
       setCorrelationPairs(pairs);
       setClusters(clusterData);
       setError(null);
+
+      // Phase 1.5 fetches (degrade gracefully if endpoints unavailable)
+      try {
+        const [quality, metadata] = await Promise.all([
+          fetchDataQuality(riskWindow, riskMethod),
+          fetchRiskMetadata(riskWindow, riskMethod),
+        ]);
+        setDataQuality(quality);
+        setRiskMetadata(metadata);
+      } catch {
+        // Silently degrade — panels will show empty state
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
@@ -1024,6 +1045,14 @@ export default function DashboardPage() {
           </div>
           <RiskContributorsTable
             contributors={riskContributors}
+            loading={riskLoading}
+          />
+          <DataQualityPanel
+            dataQuality={dataQuality}
+            loading={riskLoading}
+          />
+          <RiskMetadataPanel
+            metadata={riskMetadata}
             loading={riskLoading}
           />
         </div>

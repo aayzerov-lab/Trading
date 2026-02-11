@@ -157,6 +157,101 @@ export async function fetchMacroOverview(): Promise<MacroOverview> {
   return res.json();
 }
 
+export interface DataQualityPack {
+  coverage: {
+    "60d": CoverageMetrics;
+    "252d": CoverageMetrics;
+  };
+  integrity: IntegrityMetrics;
+  classification: ClassificationMetrics;
+  fx: FxCoverageMetrics;
+  beta_quality: BetaQualityMetrics;
+  timestamps: DataTimestamps;
+  warnings: DataWarning[];
+  computed_at: string;
+}
+
+export interface CoverageMetrics {
+  window: number;
+  included_count: number;
+  excluded_count: number;
+  excluded_exposure_pct: number;
+  top_excluded: ExcludedDetail[];
+}
+
+export interface ExcludedDetail {
+  symbol: string;
+  exposure: number;
+  exposure_pct: number;
+  reason: string;
+}
+
+export interface IntegrityMetrics {
+  missing_price_exposure_pct: number;
+  nan_rows_skipped: number;
+  outlier_return_days: number;
+  flat_streak_flags: number;
+}
+
+export interface ClassificationMetrics {
+  unknown_sector_pct: number;
+  unknown_country_pct: number;
+}
+
+export interface FxCoverageMetrics {
+  non_usd_exposure_pct: number;
+  fx_coverage_pct: number;
+  fx_issues: Record<string, string>;
+}
+
+export interface BetaQualityMetrics {
+  good_exposure_pct: number;
+  weak_exposure_pct: number;
+  invalid_exposure_pct: number;
+}
+
+export interface DataTimestamps {
+  last_positions_update: string | null;
+  last_prices_update: string | null;
+  last_fx_update: string | null;
+  last_risk_compute: string | null;
+}
+
+export interface DataWarning {
+  level: "info" | "warning" | "error";
+  message: string;
+}
+
+export interface RiskMetadata {
+  window: number;
+  effective_window: number;
+  method: string;
+  asof_date: string;
+  computed_at: string;
+  portfolio_hash: string;
+  universe_hash: string;
+  num_positions: number;
+  num_valid_symbols: number;
+  num_excluded: number;
+  portfolio_value: number;
+  excluded_symbols: string[];
+  fx_adjusted_count: number;
+  fx_flags: Record<string, string>;
+  lib_versions: Record<string, string>;
+}
+
+export async function fetchDataQuality(window: number = 252, method: string = 'lw'): Promise<DataQualityPack> {
+  const res = await fetch(`${API_URL}/risk/data-quality?window=${window}&method=${method}`);
+  if (!res.ok) throw new Error(`Failed to fetch data quality: ${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+export async function fetchRiskMetadata(window: number = 252, method: string = 'lw'): Promise<RiskMetadata> {
+  const res = await fetch(`${API_URL}/risk/metadata?window=${window}&method=${method}`);
+  if (!res.ok) throw new Error(`Failed to fetch risk metadata: ${res.status} ${res.statusText}`);
+  return res.json();
+}
+
 export async function triggerRiskRecompute(): Promise<void> {
   const res = await fetch(`${API_URL}/risk/recompute`, { method: 'POST' });
   if (!res.ok) {

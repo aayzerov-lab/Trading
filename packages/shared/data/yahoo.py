@@ -99,13 +99,13 @@ async def _store_prices(
     conid: int | None,
     engine: AsyncEngine,
 ) -> None:
-    """Store price data in the database using upsert pattern.
+    """Store price data using bulk upsert (Phase 1.5: replaces row-by-row).
 
     Args:
         symbol: Ticker symbol
         df: DataFrame with columns [date, close, adj_close]
         table: Table name ('prices_daily' or 'factor_prices_daily')
-        source: Data source identifier ('yahoo', 'ibkr', etc)
+        source: Data source identifier
         conid: Interactive Brokers contract ID (optional)
         engine: Database engine
     """
@@ -114,7 +114,27 @@ async def _store_prices(
 
     now = datetime.now(timezone.utc)
 
-    # Build upsert statement based on table
+    # Build parameter list for bulk insert
+    rows: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        if pd.isna(row["close"]):
+            continue
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "date": row["date"],
+            "close": float(row["close"]),
+            "adj_close": float(row["adj_close"]) if pd.notna(row["adj_close"]) else float(row["close"]),
+            "source": source,
+            "updated_at": now,
+        }
+        if table == "prices_daily":
+            params["conid"] = conid
+        rows.append(params)
+
+    if not rows:
+        return
+
+    # Bulk upsert
     if table == "factor_prices_daily":
         stmt = text("""
             INSERT INTO factor_prices_daily (symbol, date, close, adj_close, source, updated_at)
@@ -138,31 +158,15 @@ async def _store_prices(
         """)
 
     async with engine.begin() as conn:
-        stored = 0
-        for _, row in df.iterrows():
-            # Skip rows with NaN close price (data integrity)
-            if pd.isna(row["close"]):
-                continue
-            params: dict[str, Any] = {
-                "symbol": symbol,
-                "date": row["date"],
-                "close": float(row["close"]),
-                "adj_close": float(row["adj_close"]) if pd.notna(row["adj_close"]) else float(row["close"]),
-                "source": source,
-                "updated_at": now,
-            }
-            if table == "prices_daily":
-                params["conid"] = conid
-
-            await conn.execute(stmt, params)
-            stored += 1
+        await conn.execute(stmt, rows)
 
     logger.info(
         "prices_stored",
         symbol=symbol,
         table=table,
-        rows=stored,
+        rows=len(rows),
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -276,8 +280,8 @@ async def fetch_prices_yahoo(
             if start_date is None:
                 last_sync = await _get_last_sync_date(symbol, source, engine)
                 if last_sync:
-                    # Fetch from day after last sync
-                    fetch_start = last_sync + timedelta(days=1)
+                    # Phase 1.5: 10 business day overlap buffer (~14 calendar days)
+                    fetch_start = last_sync - timedelta(days=14)
                 else:
                     # No sync history, fetch 2 years
                     fetch_start = date.today() - timedelta(days=730)

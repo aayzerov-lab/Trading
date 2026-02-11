@@ -115,3 +115,35 @@ risk_results = Table(
         name="uq_risk_results_key",
     ),
 )
+
+# ---------------------------------------------------------------------------
+# FX rates (Phase 1.5)
+# ---------------------------------------------------------------------------
+
+fx_daily = Table(
+    "fx_daily",
+    phase1_metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("pair", String, nullable=False),
+    Column("date", Date, nullable=False),
+    Column("close", Float, nullable=False),
+    Column("adj_close", Float, nullable=True),
+    Column("source", String, nullable=False, server_default=text("'yahoo'")),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("pair", "date", name="uq_fx_daily_pair_date"),
+)
+
+# ---------------------------------------------------------------------------
+# Security overrides (Phase 1.5) – per-symbol currency & listing info
+# ---------------------------------------------------------------------------
+
+security_overrides = Table(
+    "security_overrides",
+    phase1_metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("symbol", String, nullable=False, unique=True),
+    Column("currency", String, nullable=False, server_default=text("'USD'")),
+    Column("is_usd_listed", Integer, nullable=False, server_default=text("1")),
+    Column("fx_pair", String, nullable=True),
+    Column("updated_at", DateTime(timezone=True), nullable=True),
+)

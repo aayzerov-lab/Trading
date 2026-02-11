@@ -2,12 +2,15 @@
 
 Provides high-level functions to compute and cache risk metrics for the
 current portfolio. Integrates with shared.risk modules and the Phase 1
-database schema.
+database schema.  Phase 1.5 adds FX-aware returns, data quality pack,
+regression diagnostics, and enhanced metadata.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import platform
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -16,18 +19,22 @@ import pandas as pd
 import structlog
 from sqlalchemy import text
 
+from shared.data.fx import get_fx_rates_from_db, get_security_fx_info
 from shared.data.scheduler import compute_portfolio_hash
 from shared.data.yahoo import get_prices_from_db, FACTOR_SYMBOLS
 from shared.db.engine import get_shared_engine
-from shared.risk.covariance import estimate_covariance
+from shared.risk.covariance import estimate_covariance, pairwise_cov
 from shared.risk.correlation import (
     cluster_exposures,
     correlation_matrix,
     hierarchical_clusters,
     top_correlated_pairs,
 )
+from shared.risk.data_quality import build_data_quality_pack, compute_beta_quality_summary
 from shared.risk.metrics import build_risk_contributors, build_risk_summary
 from shared.risk.returns import (
+    build_fx_aware_returns,
+    build_per_symbol_returns,
     build_price_matrix,
     compute_log_returns,
     trim_to_window,
@@ -236,73 +243,108 @@ async def compute_risk_pack(
         if not position_prices:
             return _empty_result(window, method, "No price data available")
 
-        # 5. Build returns matrix
-        # Two-pass approach: first try the full window. If that excludes a
-        # significant share of the portfolio (>10%), retry with a lower bar
-        # so newer IPOs are included at the cost of a shorter estimation window.
-        price_matrix = build_price_matrix(
-            position_prices,
+        # 4b. Fetch FX data and security info (Phase 1.5)
+        engine = get_shared_engine()
+        security_info = await get_security_fx_info(symbols, engine=engine)
+
+        # Collect FX pairs needed from security_info
+        fx_pairs_needed = list({
+            info["fx_pair"]
+            for info in security_info.values()
+            if info.get("fx_pair")
+        })
+        fx_rates: dict[str, pd.DataFrame] = {}
+        if fx_pairs_needed:
+            fx_rates = await get_fx_rates_from_db(
+                pairs=fx_pairs_needed, start_date=start_date, engine=engine
+            )
+
+        # 5. Build per-symbol return series with FX adjustment (Phase 1.5).
+        #    Each symbol keeps its own date index, trimmed to `window`.
+        MIN_HISTORY = 60
+        returns_dict, fx_flags = build_fx_aware_returns(
+            prices=position_prices,
+            fx_rates=fx_rates,
+            security_info=security_info,
             price_col="adj_close",
-            min_history=window + 1,
+            window=window,
+            min_history=MIN_HISTORY,
         )
 
-        if not price_matrix.empty:
-            # Check coverage: what % of portfolio is included?
-            included = set(price_matrix.columns)
-            included_weight = sum(
-                abs(weights[i]) for i, s in enumerate(symbols) if s in included
-            )
-            if included_weight < 0.90:
-                # Too much portfolio excluded — retry with lower min_history
-                logger.warning(
-                    "low_coverage_retrying_with_lower_min_history",
-                    included_weight=float(included_weight),
-                    included_symbols=len(included),
-                    total_symbols=len(symbols),
-                )
-                MIN_HISTORY = 60
-                price_matrix = build_price_matrix(
-                    position_prices,
-                    price_col="adj_close",
-                    min_history=MIN_HISTORY + 1,
-                )
-        else:
-            # First pass returned empty — try with lower bar
-            MIN_HISTORY = 60
-            price_matrix = build_price_matrix(
-                position_prices,
-                price_col="adj_close",
-                min_history=MIN_HISTORY + 1,
-            )
+        if not returns_dict:
+            return _empty_result(window, method, "No symbols with sufficient history")
 
-        if price_matrix.empty:
-            return _empty_result(window, method, "Empty price matrix after alignment")
-
-        returns = compute_log_returns(price_matrix)
-        valid_symbols = list(returns.columns)
-
-        # Determine effective window (use requested, or what's available)
-        effective_window = min(window, len(returns))
-        if effective_window < window:
-            logger.info(
-                "using_reduced_window",
-                requested=window,
-                effective=effective_window,
-                available_returns=len(returns),
-            )
-
-        if effective_window >= window:
-            trimmed_returns = trim_to_window(returns, window)
-        else:
-            trimmed_returns = returns
+        valid_symbols = [s for s in symbols if s in returns_dict]
+        if not valid_symbols:
+            return _empty_result(window, method, "No positions with price data")
 
         # Align weights with valid symbols
         aligned_weights = _align_weights(symbols, weights, valid_symbols)
         if aligned_weights is None:
             return _empty_result(window, method, "No positions with price data")
 
-        # 6. Estimate covariance
-        cov_matrix = estimate_covariance(trimmed_returns, method=method)
+        # 6. Estimate covariance via pairwise overlapping returns.
+        #    Each pair uses their common dates (up to `window`), so AAPL
+        #    with 252 days and CRCL with 170 days both contribute fully.
+        use_fallback = False
+        try:
+            cov_matrix = pairwise_cov(
+                returns_dict,
+                valid_symbols,
+                window=window,
+                min_overlap=max(30, MIN_HISTORY // 2),
+            )
+            # Quality check: pairwise assembly + PSD eigenvalue clamping can
+            # destroy correlation structure. Always verify the result.
+            if len(valid_symbols) > 3:
+                diag_check = np.sqrt(np.diag(cov_matrix))
+                diag_check[diag_check == 0] = 1.0
+                corr_check = cov_matrix / np.outer(diag_check, diag_check)
+                np.fill_diagonal(corr_check, 0)
+                avg_abs_corr = float(np.abs(corr_check).mean())
+                if avg_abs_corr < 0.02:
+                    n_assets = len(valid_symbols)
+                    min_obs = min(len(returns_dict[s]) for s in valid_symbols)
+                    logger.warning(
+                        "pairwise_cov: degenerate correlations, falling back to LW",
+                        avg_abs_corr=avg_abs_corr,
+                        n_assets=n_assets,
+                        min_obs=min_obs,
+                    )
+                    use_fallback = True
+        except ValueError as e:
+            logger.warning("pairwise_cov_failed_fallback", error=str(e))
+            use_fallback = True
+
+        if use_fallback:
+            # Fallback: build aligned matrix for symbols that DO overlap
+            price_matrix = build_price_matrix(
+                position_prices,
+                price_col="adj_close",
+                min_history=MIN_HISTORY + 1,
+            )
+            if price_matrix.empty:
+                return _empty_result(window, method, "Empty price matrix after alignment")
+            returns_aligned = compute_log_returns(price_matrix)
+            eff = min(window, len(returns_aligned))
+            trimmed_returns = returns_aligned.iloc[-eff:]
+            valid_symbols = list(trimmed_returns.columns)
+            aligned_weights = _align_weights(symbols, weights, valid_symbols)
+            if aligned_weights is None:
+                return _empty_result(window, method, "No positions with price data")
+            cov_matrix = estimate_covariance(trimmed_returns, method=method)
+
+        # Standalone annualized vol per symbol from its own full history
+        standalone_vols: dict[str, float] = {}
+        for sym in valid_symbols:
+            s = returns_dict[sym]
+            daily_vol = float(s.std())
+            standalone_vols[sym] = daily_vol * np.sqrt(252) * 100  # ann %
+
+        effective_window = min(
+            window,
+            min(len(returns_dict[s]) for s in valid_symbols),
+        )
 
         # 7. Compute all risk metrics
         summary = build_risk_summary(
@@ -317,10 +359,15 @@ async def compute_risk_pack(
             cov=cov_matrix,
             symbols=valid_symbols,
             portfolio_value=portfolio_value,
+            standalone_vols=standalone_vols,
         )
 
-        # Correlation analysis
-        corr = correlation_matrix(trimmed_returns)
+        # Correlation from pairwise cov: corr_ij = cov_ij / (sig_i * sig_j)
+        diag = np.sqrt(np.diag(cov_matrix))
+        diag[diag == 0] = 1.0  # avoid division by zero
+        corr_values = cov_matrix / np.outer(diag, diag)
+        np.fill_diagonal(corr_values, 1.0)
+        corr = pd.DataFrame(corr_values, index=valid_symbols, columns=valid_symbols)
         pairs = top_correlated_pairs(corr, n=20)
 
         # Cluster analysis
@@ -336,6 +383,14 @@ async def compute_risk_pack(
             cluster_result["clusters"], cluster_exp
         )
 
+        # Build an aligned returns DataFrame for stress tests (inner-join
+        # is fine here — stress tests don't need per-symbol precision).
+        aligned_returns_df = pd.DataFrame(
+            {sym: returns_dict[sym] for sym in valid_symbols}
+        ).dropna()
+        if len(aligned_returns_df) > window:
+            aligned_returns_df = aligned_returns_df.iloc[-window:]
+
         # Stress tests
         sectors = {
             p["symbol"]: (p.get("sector") or "Unknown")
@@ -346,7 +401,7 @@ async def compute_risk_pack(
         factor_returns_df = _build_factor_returns(factor_prices, window)
 
         stress_results = run_all_stress_tests(
-            position_returns=trimmed_returns,
+            position_returns=aligned_returns_df,
             factor_returns=factor_returns_df,
             weights=aligned_weights,
             symbols=valid_symbols,
@@ -358,24 +413,79 @@ async def compute_risk_pack(
         # Identify excluded positions for user transparency
         excluded = [s for s in symbols if s not in valid_symbols]
 
-        # 8. Build result pack
+        # 7b. Build data quality pack (Phase 1.5)
+        # Compute valid_symbols for both windows for coverage metrics
+        valid_symbols_60 = [s for s in symbols if s in returns_dict and len(returns_dict[s]) >= 60]
+        valid_symbols_252 = [s for s in symbols if s in returns_dict and len(returns_dict[s]) >= 252]
+
+        # Fetch timestamps for data quality panel
+        timestamps = await _get_data_timestamps()
+
+        data_quality = build_data_quality_pack(
+            positions=positions,
+            prices=position_prices,
+            returns_dict=returns_dict,
+            symbols=symbols,
+            valid_symbols_60=valid_symbols_60,
+            valid_symbols_252=valid_symbols_252,
+            security_info=security_info,
+            fx_flags=fx_flags,
+            stress_results=stress_results,
+            timestamps=timestamps,
+        )
+
+        # 7c. Negative portfolio variance guard (Phase 1.5)
+        port_var = float(aligned_weights @ cov_matrix @ aligned_weights)
+        if port_var < 0:
+            logger.error(
+                "risk_pack: NEGATIVE portfolio variance detected!",
+                port_var=port_var,
+                method=method,
+                window=window,
+            )
+
+        # 8. Build universe hash for cache identity
+        universe_hash = hashlib.sha256(
+            ",".join(sorted(valid_symbols)).encode()
+        ).hexdigest()[:12]
+
+        # 8b. Enhanced metadata (Phase 1.5)
+        fx_adjusted_count = sum(
+            1 for s in valid_symbols
+            if security_info.get(s, {}).get("fx_pair") is not None
+            and not security_info.get(s, {}).get("is_usd_listed", True)
+        )
+
+        metadata = {
+            "window": window,
+            "effective_window": effective_window,
+            "method": method,
+            "asof_date": asof.isoformat(),
+            "computed_at": datetime.now(timezone.utc).isoformat() + "Z",
+            "portfolio_hash": portfolio_hash,
+            "universe_hash": universe_hash,
+            "num_positions": len(positions),
+            "num_valid_symbols": len(valid_symbols),
+            "num_excluded": len(excluded),
+            "portfolio_value": portfolio_value,
+            "excluded_symbols": excluded,
+            "fx_adjusted_count": fx_adjusted_count,
+            "fx_flags": fx_flags,
+            "lib_versions": {
+                "numpy": np.__version__,
+                "pandas": pd.__version__,
+                "python": platform.python_version(),
+            },
+        }
+
         result = {
             "summary": summary,
             "contributors": contributors,
             "correlation_pairs": pairs,
             "clusters": clusters_with_exposure,
             "stress": stress_results,
-            "metadata": {
-                "window": window,
-                "effective_window": effective_window,
-                "method": method,
-                "asof_date": asof.isoformat(),
-                "portfolio_hash": portfolio_hash,
-                "num_positions": len(positions),
-                "num_valid_symbols": len(valid_symbols),
-                "portfolio_value": portfolio_value,
-                "excluded_symbols": excluded,
-            },
+            "data_quality": data_quality,
+            "metadata": metadata,
         }
 
         await cache_risk_result("risk_pack", asof, window, method, portfolio_hash, result)
@@ -386,6 +496,7 @@ async def compute_risk_pack(
             method=method,
             num_positions=len(positions),
             num_valid=len(valid_symbols),
+            fx_adjusted=fx_adjusted_count,
         )
 
         return result
@@ -403,6 +514,7 @@ def _empty_result(window: int, method: str, error: str) -> dict[str, Any]:
         "correlation_pairs": [],
         "clusters": [],
         "stress": {"historical": {}, "factor": {}, "computed_at": datetime.now(timezone.utc).isoformat() + "Z"},
+        "data_quality": {"coverage": {}, "integrity": {}, "warnings": [], "computed_at": datetime.now(timezone.utc).isoformat() + "Z"},
         "metadata": {
             "window": window,
             "method": method,
@@ -410,6 +522,54 @@ def _empty_result(window: int, method: str, error: str) -> dict[str, Any]:
             "error": error,
         },
     }
+
+
+async def _get_data_timestamps() -> dict[str, Any]:
+    """Fetch latest data sync timestamps for the data quality panel."""
+    timestamps: dict[str, Any] = {
+        "last_positions_update": None,
+        "last_prices_update": None,
+        "last_fx_update": None,
+        "last_risk_compute": None,
+    }
+    try:
+        engine = get_shared_engine()
+        async with engine.connect() as conn:
+            # Latest position sync
+            r = await conn.execute(text(
+                "SELECT MAX(updated_at) FROM positions_current"
+            ))
+            row = r.first()
+            if row and row[0]:
+                timestamps["last_positions_update"] = row[0].isoformat()
+
+            # Latest price sync
+            r = await conn.execute(text(
+                "SELECT MAX(last_sync) FROM data_sync_status WHERE source = 'yahoo'"
+            ))
+            row = r.first()
+            if row and row[0]:
+                timestamps["last_prices_update"] = row[0].isoformat()
+
+            # Latest FX sync
+            r = await conn.execute(text(
+                "SELECT MAX(updated_at) FROM fx_daily"
+            ))
+            row = r.first()
+            if row and row[0]:
+                timestamps["last_fx_update"] = row[0].isoformat()
+
+            # Latest risk compute
+            r = await conn.execute(text(
+                "SELECT MAX(created_at) FROM risk_results"
+            ))
+            row = r.first()
+            if row and row[0]:
+                timestamps["last_risk_compute"] = row[0].isoformat()
+    except Exception:
+        logger.debug("_get_data_timestamps: query failed (some tables may not exist yet)")
+
+    return timestamps
 
 
 def _align_weights(

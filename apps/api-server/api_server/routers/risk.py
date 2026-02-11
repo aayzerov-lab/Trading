@@ -149,6 +149,48 @@ async def stress_tests() -> dict[str, Any]:
         )
 
 
+@router.get("/metadata")
+async def risk_metadata(
+    window: int = Query(default=252, description="Lookback window in days"),
+    method: str = Query(default="lw", description="Covariance estimation method"),
+) -> dict[str, Any]:
+    """Return risk computation metadata."""
+    _validate_params(window, method)
+
+    try:
+        logger.info("risk_metadata_request", window=window, method=method)
+        result = await compute_risk_pack(window=window, method=method)
+        return result.get("metadata", {"error": "metadata not available (stale cache?)"})
+
+    except Exception as e:
+        logger.exception("risk_metadata_failed", window=window, method=method)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Risk computation failed: {str(e)}",
+        )
+
+
+@router.get("/data-quality")
+async def risk_data_quality(
+    window: int = Query(default=252, description="Lookback window in days"),
+    method: str = Query(default="lw", description="Covariance estimation method"),
+) -> dict[str, Any]:
+    """Return data quality metrics."""
+    _validate_params(window, method)
+
+    try:
+        logger.info("risk_data_quality_request", window=window, method=method)
+        result = await compute_risk_pack(window=window, method=method)
+        return result.get("data_quality", {"coverage": {}, "integrity": {}, "warnings": [], "computed_at": ""})
+
+    except Exception as e:
+        logger.exception("risk_data_quality_failed", window=window, method=method)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Risk computation failed: {str(e)}",
+        )
+
+
 @router.post("/recompute")
 async def recompute_risk() -> dict[str, str]:
     """Force recomputation of all risk metrics."""

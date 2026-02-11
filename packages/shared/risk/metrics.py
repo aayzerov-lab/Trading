@@ -390,6 +390,7 @@ def build_risk_contributors(
     cov: np.ndarray,
     symbols: List[str],
     portfolio_value: float,
+    standalone_vols: Dict[str, float] | None = None,
 ) -> List[Dict]:
     """Build per-position risk contribution table.
 
@@ -398,6 +399,9 @@ def build_risk_contributors(
         cov: Daily covariance matrix (N x N)
         symbols: List of symbols
         portfolio_value: Total portfolio value in USD
+        standalone_vols: Optional {symbol: annualized_vol_%} computed from
+            each symbol's own history.  When provided these are used instead
+            of the covariance diagonal (which may be distorted by alignment).
 
     Returns:
         List of dicts, one per position, sorted by |CCR| descending
@@ -421,9 +425,13 @@ def build_risk_contributors(
     # Portfolio volatility for percentage calculations
     port_vol = portfolio_volatility(weights, cov, horizon_days=1)
 
-    # Standalone annualized vol from covariance diagonal
-    daily_vols = np.sqrt(np.diag(cov))
-    ann_vols = daily_vols * np.sqrt(252) * 100  # annualized %
+    # Standalone annualized vol: prefer per-symbol vols if provided
+    if standalone_vols is None:
+        daily_vols = np.sqrt(np.diag(cov))
+        ann_vols_arr = daily_vols * np.sqrt(252) * 100  # annualized %
+        ann_vols_map = {symbols[i]: float(ann_vols_arr[i]) for i in range(len(symbols))}
+    else:
+        ann_vols_map = standalone_vols
 
     # Build list of dicts
     contributors = []
@@ -441,7 +449,7 @@ def build_risk_contributors(
             'mcr': float(mcr[i]),
             'ccr': float(ccr[i]),
             'ccr_pct': ccr_pct,
-            'standalone_vol_ann': float(ann_vols[i]),
+            'standalone_vol_ann': ann_vols_map.get(symbol, 0.0),
         })
 
     # Sort by absolute CCR descending

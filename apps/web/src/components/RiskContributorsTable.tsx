@@ -125,8 +125,9 @@ export default function RiskContributorsTable({
                 className="cell-right"
                 onClick={() => handleSort("ccr")}
                 style={{ cursor: "pointer" }}
+                title="Component Contribution to Risk (basis points)"
               >
-                CCR
+                CCR (bps)
                 {sortKey === "ccr" && (
                   <span className="sort-indicator">
                     {sortDir === "asc" ? " ▲" : " ▼"}
@@ -173,7 +174,7 @@ export default function RiskContributorsTable({
                   <td className="cell-symbol">{c.symbol}</td>
                   <td className="cell-right">{fmtNumber(c.weight_pct, 2)}</td>
                   <td className="cell-right">{fmtNumber(c.mcr, 4)}</td>
-                  <td className="cell-right">{fmtNumber(c.ccr, 0)}</td>
+                  <td className="cell-right">{fmtNumber(c.ccr * 10000, 1)}</td>
                   <td className="cell-right">{fmtNumber(c.ccr_pct, 2)}</td>
                   <td className={`cell-right ${volClass}`}>
                     {fmtNumber(c.standalone_vol_ann, 1)}

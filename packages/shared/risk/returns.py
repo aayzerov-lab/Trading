@@ -250,6 +250,73 @@ def trim_to_window(returns: pd.DataFrame, window: int) -> pd.DataFrame:
     return trimmed
 
 
+def build_per_symbol_returns(
+    prices: Dict[str, pd.DataFrame],
+    price_col: str = "adj_close",
+    window: int = 252,
+    min_history: int = 60,
+) -> Dict[str, pd.Series]:
+    """Build per-symbol log-return series without forcing alignment.
+
+    Each symbol keeps its own date index trimmed to the last *window*
+    observations.  Symbols with fewer than *min_history* price rows are
+    dropped.
+
+    Args:
+        prices: {symbol: DataFrame} with columns [date, close, adj_close].
+        price_col: which column to use for prices.
+        window: maximum number of *returns* (prices - 1) to keep.
+        min_history: minimum price rows required (must be >= 2 for 1 return).
+
+    Returns:
+        {symbol: pd.Series} of log returns indexed by date.
+    """
+    min_history = max(min_history, 2)  # need at least 2 prices for 1 return
+    result: Dict[str, pd.Series] = {}
+
+    for symbol, df in prices.items():
+        if df is None or df.empty:
+            continue
+        if price_col not in df.columns or "date" not in df.columns:
+            continue
+
+        df = df.copy()
+        if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+            df["date"] = pd.to_datetime(df["date"])
+
+        df = df.set_index("date").sort_index()
+        p = df[price_col].dropna()
+
+        if len(p) < min_history:
+            logger.info(
+                "build_per_symbol_returns: dropping symbol",
+                symbol=symbol,
+                rows=len(p),
+                min_history=min_history,
+            )
+            continue
+
+        # Trim prices to last (window+1) so we get at most `window` returns
+        p = p.iloc[-(window + 1):]
+
+        if (p <= 0).any():
+            logger.warning(
+                "build_per_symbol_returns: non-positive prices",
+                symbol=symbol,
+            )
+            continue
+
+        log_ret = np.log(p / p.shift(1)).iloc[1:]  # drop first NaN
+        result[symbol] = log_ret
+
+    logger.info(
+        "build_per_symbol_returns: built",
+        num_symbols=len(result),
+        window=window,
+    )
+    return result
+
+
 def get_aligned_position_returns(
     position_symbols: List[str],
     all_prices: Dict[str, pd.DataFrame],
@@ -340,3 +407,130 @@ def get_aligned_position_returns(
     )
 
     return returns, missing_symbols
+
+
+def build_fx_aware_returns(
+    prices: Dict[str, pd.DataFrame],
+    fx_rates: Dict[str, pd.DataFrame],
+    security_info: Dict[str, dict],
+    price_col: str = "adj_close",
+    window: int = 252,
+    min_history: int = 60,
+) -> Tuple[Dict[str, pd.Series], Dict[str, str]]:
+    """Build per-symbol USD log-return series with FX adjustment.
+
+    For symbols where security_info indicates non-USD and not USD-listed:
+        r_usd = r_local + r_fx
+    where r_fx = log(fx_t / fx_{t-1}) and fx is USD per 1 unit of local ccy.
+
+    For USD or USD-listed symbols:
+        r_usd = r_local
+
+    Args:
+        prices: {symbol: DataFrame} with [date, close, adj_close]
+        fx_rates: {pair_name: DataFrame} with [date, close, adj_close]
+            pair_name like 'EURUSD' = USD per 1 EUR
+        security_info: {symbol: {currency, is_usd_listed, fx_pair}}
+        price_col: which price column to use
+        window: max return observations
+        min_history: min price rows required
+
+    Returns:
+        Tuple of:
+        - {symbol: pd.Series} of USD log returns indexed by date
+        - {symbol: str} flags for symbols with FX issues
+    """
+    min_history = max(min_history, 2)
+    result: Dict[str, pd.Series] = {}
+    fx_flags: Dict[str, str] = {}
+
+    for symbol, df in prices.items():
+        if df is None or df.empty:
+            continue
+        if price_col not in df.columns or "date" not in df.columns:
+            continue
+
+        df = df.copy()
+        if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+            df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        p = df[price_col].dropna()
+
+        if len(p) < min_history:
+            continue
+
+        # Trim to window+1 prices => window returns
+        p = p.iloc[-(window + 1):]
+
+        if (p <= 0).any():
+            logger.warning("build_fx_aware_returns: non-positive prices", symbol=symbol)
+            continue
+
+        log_ret_local = np.log(p / p.shift(1)).iloc[1:]
+
+        # Check if FX adjustment needed
+        info = security_info.get(symbol, {})
+        ccy = info.get("currency", "USD")
+        is_usd_listed = info.get("is_usd_listed", True)
+        fx_pair = info.get("fx_pair")
+
+        if ccy != "USD" and not is_usd_listed and fx_pair:
+            # Need FX adjustment
+            fx_df = fx_rates.get(fx_pair)
+            if fx_df is None or fx_df.empty:
+                fx_flags[symbol] = "missing_fx_data"
+                logger.warning(
+                    "build_fx_aware_returns: missing FX data",
+                    symbol=symbol,
+                    fx_pair=fx_pair,
+                )
+                # Fall back to local returns (unmodeled FX)
+                result[symbol] = log_ret_local
+                continue
+
+            # Build FX returns
+            fx_df_c = fx_df.copy()
+            if not pd.api.types.is_datetime64_any_dtype(fx_df_c["date"]):
+                fx_df_c["date"] = pd.to_datetime(fx_df_c["date"])
+            fx_df_c = fx_df_c.set_index("date").sort_index()
+
+            fx_col = "adj_close" if "adj_close" in fx_df_c.columns and fx_df_c["adj_close"].notna().any() else "close"
+            fx_p = fx_df_c[fx_col].dropna()
+
+            if len(fx_p) < min_history:
+                fx_flags[symbol] = "insufficient_fx_history"
+                result[symbol] = log_ret_local
+                continue
+
+            fx_p = fx_p.iloc[-(window + 1):]
+            fx_ret = np.log(fx_p / fx_p.shift(1)).iloc[1:]
+
+            # Align dates
+            common_dates = log_ret_local.index.intersection(fx_ret.index)
+            if len(common_dates) < min_history:
+                fx_flags[symbol] = f"fx_overlap_{len(common_dates)}"
+                result[symbol] = log_ret_local
+                continue
+
+            r_local_aligned = log_ret_local.loc[common_dates]
+            r_fx_aligned = fx_ret.loc[common_dates]
+            r_usd = r_local_aligned + r_fx_aligned
+
+            result[symbol] = r_usd
+            logger.info(
+                "build_fx_aware_returns: FX-adjusted",
+                symbol=symbol,
+                fx_pair=fx_pair,
+                overlap=len(common_dates),
+            )
+        else:
+            result[symbol] = log_ret_local
+
+    logger.info(
+        "build_fx_aware_returns: built",
+        num_symbols=len(result),
+        fx_adjusted=sum(1 for s in result if security_info.get(s, {}).get("fx_pair") is not None
+                        and not security_info.get(s, {}).get("is_usd_listed", True)),
+        fx_flags=len(fx_flags),
+    )
+    return result, fx_flags

@@ -89,6 +89,14 @@ FACTOR_SHOCKS = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Regression quality thresholds (Phase 1.5)
+# ---------------------------------------------------------------------------
+
+MIN_OVERLAP_BETA = 60       # Minimum overlap for valid beta
+WARN_OVERLAP_BETA = 120     # Overlap threshold for "Good" quality
+MIN_R2_GOOD = 0.20          # R\u00b2 threshold for "Good" quality
+
 
 def historical_stress_test(
     position_returns: pd.DataFrame,
@@ -301,6 +309,80 @@ def historical_stress_test(
     return result
 
 
+def compute_regression_diagnostics(
+    position_ret: np.ndarray,
+    factor_ret: np.ndarray,
+    overlap: int,
+) -> Dict:
+    """Compute regression diagnostics for a position-factor pair.
+
+    Returns:
+        Dict with beta, r2, stderr_beta, t_stat, overlap, quality label
+    """
+    if overlap < 2:
+        return {
+            "beta": 0.0,
+            "r2": 0.0,
+            "stderr_beta": float("inf"),
+            "t_stat": 0.0,
+            "overlap": overlap,
+            "quality": "invalid",
+        }
+
+    factor_var = np.var(factor_ret, ddof=1)
+    if factor_var == 0 or np.isnan(factor_var):
+        return {
+            "beta": 0.0,
+            "r2": 0.0,
+            "stderr_beta": float("inf"),
+            "t_stat": 0.0,
+            "overlap": overlap,
+            "quality": "invalid",
+        }
+
+    covariance = np.cov(position_ret, factor_ret, ddof=1)[0, 1]
+    beta = covariance / factor_var
+
+    # R\u00b2 = correlation\u00b2 = (cov / (std_x * std_y))\u00b2
+    pos_std = np.std(position_ret, ddof=1)
+    fac_std = np.sqrt(factor_var)
+    if pos_std == 0 or fac_std == 0:
+        r2 = 0.0
+    else:
+        corr = covariance / (pos_std * fac_std)
+        r2 = float(corr ** 2)
+
+    # Standard error of beta: SE = sqrt(SSR / ((n-2) * SSX))
+    residuals = position_ret - beta * factor_ret
+    ssr = float(np.sum(residuals ** 2))
+    ssx = float(np.sum((factor_ret - np.mean(factor_ret)) ** 2))
+
+    if overlap > 2 and ssx > 0:
+        stderr_beta = float(np.sqrt(ssr / ((overlap - 2) * ssx)))
+    else:
+        stderr_beta = float("inf")
+
+    # t-statistic
+    t_stat = float(beta / stderr_beta) if stderr_beta > 0 and stderr_beta != float("inf") else 0.0
+
+    # Quality label
+    if overlap < MIN_OVERLAP_BETA:
+        quality = "invalid"
+    elif overlap >= WARN_OVERLAP_BETA and r2 >= MIN_R2_GOOD:
+        quality = "good"
+    else:
+        quality = "weak"
+
+    return {
+        "beta": float(beta),
+        "r2": float(r2),
+        "stderr_beta": float(stderr_beta),
+        "t_stat": float(t_stat),
+        "overlap": int(overlap),
+        "quality": quality,
+    }
+
+
 def factor_stress_test(
     position_returns: pd.DataFrame,
     factor_returns: pd.DataFrame,
@@ -367,8 +449,9 @@ def factor_stress_test(
     position_returns_aligned = position_returns.loc[common_dates]
     factor_returns_aligned = factor_returns.loc[common_dates]
 
-    # Compute betas for each position against each shocked factor
+    # Compute betas for each position against each shocked factor (Phase 1.5: with diagnostics)
     position_impacts = {}
+    regression_diagnostics = {}  # Phase 1.5: store diagnostics per position
 
     for symbol in symbols:
         if symbol not in position_returns_aligned.columns:
@@ -381,28 +464,35 @@ def factor_stress_test(
 
         position_ret = position_returns_aligned[symbol].values
         total_impact = 0.0
+        symbol_diags = {}
 
         for factor_symbol, shock in shocks.items():
             if factor_symbol not in factor_returns_aligned.columns:
-                # Factor not available, skip
                 continue
 
             factor_ret = factor_returns_aligned[factor_symbol].values
+            overlap = len(factor_ret)
 
-            # Compute beta: cov(position, factor) / var(factor)
-            factor_var = np.var(factor_ret, ddof=1)
+            diag = compute_regression_diagnostics(position_ret, factor_ret, overlap)
+            symbol_diags[factor_symbol] = diag
 
-            if factor_var == 0 or np.isnan(factor_var):
+            # For invalid betas, set impact to 0 (flagged in diagnostics)
+            if diag["quality"] == "invalid":
+                logger.warning(
+                    "factor_stress_test: invalid beta excluded",
+                    symbol=symbol,
+                    factor=factor_symbol,
+                    overlap=diag["overlap"],
+                    r2=diag["r2"],
+                )
                 continue
 
-            covariance = np.cov(position_ret, factor_ret, ddof=1)[0, 1]
-            beta = covariance / factor_var
-
-            # Impact from this factor
-            impact = beta * shock
+            impact = diag["beta"] * shock
             total_impact += impact
 
         position_impacts[symbol] = total_impact
+        regression_diagnostics[symbol] = symbol_diags
+
 
     if not position_impacts:
         logger.warning(
@@ -470,6 +560,7 @@ def factor_stress_test(
         'portfolio_pnl': float(portfolio_pnl),
         'top_contributors': top_contributors,
         'by_sector': by_sector,
+        'regression_diagnostics': regression_diagnostics,
     }
 
     logger.info(

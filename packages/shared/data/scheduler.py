@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -164,6 +164,14 @@ async def run_daily_data_update(
     except Exception as e:
         logger.error("position_fetch_error", error=str(e), exc_info=True)
         stats["errors"].append(f"position_fetch: {e}")
+
+    # Step 3.5: Fetch FX rates (Phase 1.5)
+    try:
+        fx_stats = await run_fx_data_update(engine, redis_client)
+        stats["fx_pairs"] = fx_stats.get("pairs_fetched", 0)
+    except Exception as e:
+        logger.error("fx_update_error", error=str(e), exc_info=True)
+        stats["errors"].append(f"fx_update: {e}")
 
     try:
         # Step 4: Fetch FRED series
@@ -341,3 +349,139 @@ async def run_daily_jobs(
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
     logger.info("daily_jobs_completed")
     return results
+
+
+# ---------------------------------------------------------------------------
+# Weekly adjustment sweep (Phase 1.5)
+# ---------------------------------------------------------------------------
+
+
+async def run_weekly_adjustment_sweep(
+    engine: AsyncEngine,
+    redis_client: Any = None,
+) -> dict[str, Any]:
+    """Re-fetch last 60 trading days for all symbols to capture retroactive
+    adj_close corrections (splits, dividends, etc.).
+
+    Should be run once per week (e.g., Saturday morning).
+
+    Args:
+        engine: Database engine
+        redis_client: Optional Redis client for event publishing
+
+    Returns:
+        Dictionary with sweep statistics
+    """
+    logger.info("weekly_adjustment_sweep_started")
+    stats: dict[str, Any] = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "factors": 0,
+        "positions": 0,
+        "fx_pairs": 0,
+        "errors": [],
+    }
+
+    # ~60 trading days = ~84 calendar days
+    sweep_start = date.today() - timedelta(days=90)
+
+    # Step 1: Re-fetch factor prices
+    try:
+        from .yahoo import FACTOR_SYMBOLS, fetch_prices_yahoo
+        factor_results = await fetch_prices_yahoo(
+            symbols=FACTOR_SYMBOLS,
+            start_date=sweep_start,
+            engine=engine,
+            is_factor=True,
+        )
+        stats["factors"] = len(factor_results)
+    except Exception as e:
+        logger.error("weekly_sweep_factor_error", error=str(e))
+        stats["errors"].append(f"factors: {e}")
+
+    # Step 2: Re-fetch position prices
+    try:
+        from .yahoo import fetch_prices_yahoo
+        position_symbols = await _get_position_symbols(engine)
+        if position_symbols:
+            pos_results = await fetch_prices_yahoo(
+                symbols=position_symbols,
+                start_date=sweep_start,
+                engine=engine,
+                is_factor=False,
+            )
+            stats["positions"] = len(pos_results)
+    except Exception as e:
+        logger.error("weekly_sweep_position_error", error=str(e))
+        stats["errors"].append(f"positions: {e}")
+
+    # Step 3: Re-fetch FX rates
+    try:
+        from .fx import fetch_fx_rates, get_required_fx_currencies
+        currencies = await get_required_fx_currencies(engine)
+        if currencies:
+            fx_results = await fetch_fx_rates(currencies, engine=engine)
+            stats["fx_pairs"] = len(fx_results)
+    except Exception as e:
+        logger.error("weekly_sweep_fx_error", error=str(e))
+        stats["errors"].append(f"fx: {e}")
+
+    # Publish event
+    if redis_client:
+        try:
+            event = {
+                "event": "adjustment_sweep_complete",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "stats": stats,
+            }
+            await redis_client.publish(
+                "trading:events",
+                json.dumps(event),
+            )
+        except Exception as e:
+            stats["errors"].append(f"redis: {e}")
+
+    stats["completed_at"] = datetime.now(timezone.utc).isoformat()
+    logger.info("weekly_adjustment_sweep_completed", stats=stats)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# FX data update (Phase 1.5)
+# ---------------------------------------------------------------------------
+
+
+async def run_fx_data_update(
+    engine: AsyncEngine,
+    redis_client: Any = None,
+) -> dict[str, Any]:
+    """Fetch FX rates for any non-USD positions.
+
+    Args:
+        engine: Database engine
+        redis_client: Optional Redis client
+
+    Returns:
+        Dictionary with FX update stats
+    """
+    logger.info("fx_data_update_started")
+    stats: dict[str, Any] = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "pairs_fetched": 0,
+        "errors": [],
+    }
+
+    try:
+        from .fx import fetch_fx_rates, get_required_fx_currencies
+        currencies = await get_required_fx_currencies(engine)
+        if currencies:
+            results = await fetch_fx_rates(currencies, engine=engine)
+            stats["pairs_fetched"] = len(results)
+            logger.info("fx_data_updated", pairs=len(results), currencies=currencies)
+        else:
+            logger.info("fx_no_currencies_needed")
+    except Exception as e:
+        logger.error("fx_data_update_error", error=str(e))
+        stats["errors"].append(str(e))
+
+    stats["completed_at"] = datetime.now(timezone.utc).isoformat()
+    return stats
