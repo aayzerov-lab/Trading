@@ -1,0 +1,240 @@
+"""
+Covariance Estimation Module
+
+Implements multiple covariance matrix estimation methods for portfolio risk analytics.
+Includes Ledoit-Wolf shrinkage and EWMA (RiskMetrics) approaches.
+"""
+
+import numpy as np
+import pandas as pd
+import structlog
+from sklearn.covariance import LedoitWolf
+
+logger = structlog.get_logger(__name__)
+
+
+def ledoit_wolf_cov(returns: pd.DataFrame) -> np.ndarray:
+    """Estimate covariance matrix using Ledoit-Wolf shrinkage.
+
+    Uses sklearn's LedoitWolf estimator which automatically determines
+    the optimal shrinkage intensity. Handles the T < N case gracefully.
+
+    Args:
+        returns: DataFrame of returns (T x N) where T = time periods, N = assets
+
+    Returns:
+        N x N covariance matrix as numpy array
+
+    Raises:
+        ValueError: If returns DataFrame is empty or has insufficient data
+    """
+    if returns.empty:
+        raise ValueError("Cannot estimate covariance from empty returns DataFrame")
+
+    if len(returns) < 2:
+        raise ValueError(f"Need at least 2 observations, got {len(returns)}")
+
+    # Convert to numpy array
+    returns_array = returns.values
+
+    # Check for NaN values
+    if np.isnan(returns_array).any():
+        nan_counts = np.isnan(returns_array).sum(axis=0)
+        affected_symbols = [
+            returns.columns[i]
+            for i, count in enumerate(nan_counts)
+            if count > 0
+        ]
+        logger.error(
+            "ledoit_wolf_cov: NaN values in returns",
+            affected_symbols=affected_symbols
+        )
+        raise ValueError(f"NaN values detected in returns for symbols: {affected_symbols}")
+
+    # Estimate covariance using Ledoit-Wolf
+    lw = LedoitWolf()
+    try:
+        cov_matrix = lw.fit(returns_array).covariance_
+    except Exception as e:
+        logger.error(
+            "ledoit_wolf_cov: estimation failed",
+            error=str(e),
+            shape=returns_array.shape
+        )
+        raise
+
+    # Verify positive semi-definite and fix if needed
+    eigenvalues = np.linalg.eigvalsh(cov_matrix)
+    min_eigenvalue = float(np.min(eigenvalues))
+
+    if min_eigenvalue < -1e-8:
+        logger.warning(
+            "ledoit_wolf_cov: non-PSD matrix, clamping negative eigenvalues",
+            min_eigenvalue=min_eigenvalue
+        )
+        eigenvalues_clamped = np.maximum(eigenvalues, 0)
+        eigvecs = np.linalg.eigh(cov_matrix)[1]
+        cov_matrix = eigvecs @ np.diag(eigenvalues_clamped) @ eigvecs.T
+        cov_matrix = (cov_matrix + cov_matrix.T) / 2
+
+    logger.info(
+        "ledoit_wolf_cov: covariance estimated",
+        num_assets=cov_matrix.shape[0],
+        num_observations=len(returns),
+        shrinkage=float(lw.shrinkage_),
+        condition_number=float(np.linalg.cond(cov_matrix))
+    )
+
+    return cov_matrix
+
+
+def ewma_cov(returns: pd.DataFrame, lambd: float = 0.94) -> np.ndarray:
+    """Estimate covariance matrix using Exponentially Weighted Moving Average.
+
+    Standard RiskMetrics EWMA implementation:
+    sigma_t = lambda * sigma_{t-1} + (1 - lambda) * r_t * r_t'
+
+    Computes iteratively from oldest to newest observation.
+
+    Args:
+        returns: DataFrame of returns (T x N)
+        lambd: Decay factor (default 0.94, standard RiskMetrics)
+
+    Returns:
+        N x N covariance matrix as numpy array
+
+    Raises:
+        ValueError: If returns is empty or lambda is invalid
+    """
+    if returns.empty:
+        raise ValueError("Cannot estimate covariance from empty returns DataFrame")
+
+    if not 0 < lambd < 1:
+        raise ValueError(f"Lambda must be between 0 and 1, got {lambd}")
+
+    if len(returns) < 2:
+        raise ValueError(f"Need at least 2 observations, got {len(returns)}")
+
+    # Convert to numpy array
+    returns_array = returns.values
+
+    # Check for NaN values
+    if np.isnan(returns_array).any():
+        nan_counts = np.isnan(returns_array).sum(axis=0)
+        affected_symbols = [
+            returns.columns[i]
+            for i, count in enumerate(nan_counts)
+            if count > 0
+        ]
+        logger.error(
+            "ewma_cov: NaN values in returns",
+            affected_symbols=affected_symbols
+        )
+        raise ValueError(f"NaN values detected in returns for symbols: {affected_symbols}")
+
+    T, N = returns_array.shape
+
+    # Initialize with sample covariance of first 10 observations (or all if < 10)
+    init_window = min(10, T)
+    cov_matrix = np.cov(returns_array[:init_window].T, ddof=1)
+
+    # Handle single asset case
+    if N == 1:
+        cov_matrix = np.array([[cov_matrix]])
+
+    # Iterate through observations, updating covariance
+    for t in range(init_window, T):
+        r_t = returns_array[t].reshape(-1, 1)  # Column vector
+        cov_matrix = lambd * cov_matrix + (1 - lambd) * (r_t @ r_t.T)
+
+    # Ensure symmetry (numerical stability)
+    cov_matrix = (cov_matrix + cov_matrix.T) / 2
+
+    # Verify positive semi-definite and fix if needed
+    eigenvalues = np.linalg.eigvalsh(cov_matrix)
+    min_eigenvalue = float(np.min(eigenvalues))
+
+    if min_eigenvalue < -1e-8:
+        logger.warning(
+            "ewma_cov: non-PSD matrix, clamping negative eigenvalues",
+            min_eigenvalue=min_eigenvalue
+        )
+        eigenvalues_clamped = np.maximum(eigenvalues, 0)
+        eigvecs = np.linalg.eigh(cov_matrix)[1]
+        cov_matrix = eigvecs @ np.diag(eigenvalues_clamped) @ eigvecs.T
+        cov_matrix = (cov_matrix + cov_matrix.T) / 2
+
+    logger.info(
+        "ewma_cov: covariance estimated",
+        num_assets=N,
+        num_observations=T,
+        lambda_param=lambd,
+        condition_number=float(np.linalg.cond(cov_matrix))
+    )
+
+    return cov_matrix
+
+
+def estimate_covariance(
+    returns: pd.DataFrame,
+    method: str = 'lw',
+    ewma_lambda: float = 0.94,
+) -> np.ndarray:
+    """Unified interface for covariance estimation.
+
+    Args:
+        returns: DataFrame of returns (T x N)
+        method: Estimation method - 'lw' for Ledoit-Wolf, 'ewma' for EWMA
+        ewma_lambda: Decay factor for EWMA (only used if method='ewma')
+
+    Returns:
+        N x N covariance matrix as numpy array
+
+    Raises:
+        ValueError: If method is invalid or estimation fails
+    """
+    if returns.empty:
+        raise ValueError("Cannot estimate covariance from empty returns DataFrame")
+
+    method = method.lower()
+
+    if method == 'lw':
+        logger.info("estimate_covariance: using Ledoit-Wolf shrinkage")
+        return ledoit_wolf_cov(returns)
+    elif method == 'ewma':
+        logger.info("estimate_covariance: using EWMA", lambda_param=ewma_lambda)
+        return ewma_cov(returns, lambd=ewma_lambda)
+    else:
+        raise ValueError(f"Unknown covariance estimation method: {method}. Use 'lw' or 'ewma'")
+
+
+def annualize_cov(cov: np.ndarray, trading_days: int = 252) -> np.ndarray:
+    """Annualize a daily covariance matrix.
+
+    For daily covariance, annualized covariance = daily_cov * trading_days
+
+    Args:
+        cov: Daily covariance matrix (N x N)
+        trading_days: Number of trading days per year (default 252)
+
+    Returns:
+        Annualized covariance matrix (N x N)
+    """
+    if cov.size == 0:
+        raise ValueError("Cannot annualize empty covariance matrix")
+
+    if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+        raise ValueError(f"Covariance matrix must be square, got shape {cov.shape}")
+
+    if trading_days <= 0:
+        raise ValueError(f"Trading days must be positive, got {trading_days}")
+
+    annualized = cov * trading_days
+
+    logger.info(
+        "annualize_cov: covariance annualized",
+        trading_days=trading_days,
+        matrix_size=cov.shape[0]
+    )
+
+    return annualized
