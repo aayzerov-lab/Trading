@@ -44,8 +44,6 @@ FACTOR_SHOCKS = {
         'name': 'Equity Crash',
         'shocks': {
             'SPY': -0.10,
-            'QQQ': -0.10,
-            'IWM': -0.12,
         },
     },
     'rates_up': {
@@ -79,7 +77,6 @@ FACTOR_SHOCKS = {
         'name': 'Combined Stress',
         'shocks': {
             'SPY': -0.10,
-            'QQQ': -0.10,
             'TLT': -0.05,
             'HYG': -0.05,
             'UUP': 0.03,
@@ -93,8 +90,9 @@ FACTOR_SHOCKS = {
 # Regression quality thresholds (Phase 1.5)
 # ---------------------------------------------------------------------------
 
-MIN_OVERLAP_BETA = 60       # Minimum overlap for valid beta
-WARN_OVERLAP_BETA = 120     # Overlap threshold for "Good" quality
+BETA_WINDOW = 60             # Rolling window for beta estimation (trading days)
+MIN_OVERLAP_BETA = 40        # Minimum overlap for valid beta
+WARN_OVERLAP_BETA = 50       # Overlap threshold for "Good" quality
 MIN_R2_GOOD = 0.20          # R\u00b2 threshold for "Good" quality
 
 
@@ -446,8 +444,9 @@ def factor_stress_test(
         )
         return None
 
-    position_returns_aligned = position_returns.loc[common_dates]
-    factor_returns_aligned = factor_returns.loc[common_dates]
+    # Use rolling window: take last BETA_WINDOW days for reactive beta estimation
+    position_returns_aligned = position_returns.loc[common_dates].iloc[-BETA_WINDOW:]
+    factor_returns_aligned = factor_returns.loc[common_dates].iloc[-BETA_WINDOW:]
 
     # Compute betas for each position against each shocked factor (Phase 1.5: with diagnostics)
     position_impacts = {}
@@ -553,6 +552,18 @@ def factor_stress_test(
 
         by_sector.sort(key=lambda x: abs(x['pnl']), reverse=True)
 
+    # Compute portfolio-level effective factor exposures
+    factor_exposures = {}
+    for factor_symbol in shocks:
+        portfolio_beta = 0.0
+        for symbol in position_impacts:
+            idx = symbols.index(symbol)
+            weight = weights[idx]
+            diag = regression_diagnostics.get(symbol, {}).get(factor_symbol, {})
+            if diag.get("quality") != "invalid":
+                portfolio_beta += weight * diag.get("beta", 0.0)
+        factor_exposures[f"portfolio_beta_{factor_symbol}"] = float(portfolio_beta)
+
     result = {
         'scenario': scenario_name,
         'period': 'Parameter Shock',
@@ -560,6 +571,7 @@ def factor_stress_test(
         'portfolio_pnl': float(portfolio_pnl),
         'top_contributors': top_contributors,
         'by_sector': by_sector,
+        'factor_exposures': factor_exposures,
         'regression_diagnostics': regression_diagnostics,
     }
 

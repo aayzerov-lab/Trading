@@ -16,6 +16,7 @@ from numpy.testing import assert_allclose
 from shared.risk.returns import build_fx_aware_returns
 from shared.risk.stress import (
     compute_regression_diagnostics,
+    BETA_WINDOW,
     MIN_OVERLAP_BETA,
     WARN_OVERLAP_BETA,
     MIN_R2_GOOD,
@@ -197,9 +198,9 @@ class TestRegressionDiagnostics:
     """Tests for regression diagnostics in stress testing."""
 
     def test_good_quality_high_r2_long_overlap(self):
-        """Overlap >= 120, R² >= 0.20 should give quality='good'."""
+        """Overlap >= 50, R² >= 0.20 should give quality='good'."""
         np.random.seed(42)
-        overlap = 150
+        overlap = 55
 
         # Generate correlated returns (high R²)
         factor_ret = np.random.normal(0.001, 0.02, overlap)
@@ -217,9 +218,9 @@ class TestRegressionDiagnostics:
         assert abs(diag['beta'] - beta_true) < 0.5  # Should be close
 
     def test_weak_quality_low_r2(self):
-        """Overlap >= 120, R² < 0.20 should give quality='weak'."""
+        """Overlap >= WARN_OVERLAP_BETA but R² < 0.20 should give quality='weak'."""
         np.random.seed(42)
-        overlap = 120
+        overlap = 55
 
         # Generate weakly correlated returns (low R²)
         factor_ret = np.random.normal(0.001, 0.02, overlap)
@@ -232,9 +233,9 @@ class TestRegressionDiagnostics:
         assert diag['r2'] < MIN_R2_GOOD
 
     def test_invalid_quality_short_overlap(self):
-        """Overlap < 60 should give quality='invalid'."""
+        """Overlap < 40 should give quality='invalid'."""
         np.random.seed(42)
-        overlap = 50
+        overlap = 30
 
         factor_ret = np.random.normal(0.001, 0.02, overlap)
         position_ret = 1.5 * factor_ret + np.random.normal(0, 0.01, overlap)
@@ -248,22 +249,22 @@ class TestRegressionDiagnostics:
     def test_invalid_beta_excluded(self):
         """When quality='invalid', beta should be set to 0 in stress test."""
         np.random.seed(42)
-        dates = pd.bdate_range('2024-01-01', periods=50)
+        dates = pd.bdate_range('2024-01-01', periods=30)
 
-        # Short history (invalid)
+        # Short history (invalid: 30 < MIN_OVERLAP_BETA=40)
         position_returns = pd.DataFrame({
-            'AAPL': np.random.normal(0.001, 0.02, 50)
+            'AAPL': np.random.normal(0.001, 0.02, 30)
         }, index=dates)
 
         factor_returns = pd.DataFrame({
-            'SPY': np.random.normal(0.001, 0.015, 50)
+            'SPY': np.random.normal(0.001, 0.015, 30)
         }, index=dates)
 
         # Direct test: regression diagnostics should mark as invalid
         position_ret = position_returns['AAPL'].values
         factor_ret = factor_returns['SPY'].values
 
-        diag = compute_regression_diagnostics(position_ret, factor_ret, overlap=50)
+        diag = compute_regression_diagnostics(position_ret, factor_ret, overlap=30)
 
         assert diag['quality'] == 'invalid'
         # When invalid, factor_stress_test should skip this beta (set impact to 0)
@@ -529,10 +530,11 @@ class TestRegressionQualityConstants:
 
     def test_constants_defined(self):
         """Verify threshold constants exist and have reasonable values."""
-        assert MIN_OVERLAP_BETA == 60
-        assert WARN_OVERLAP_BETA == 120
+        assert BETA_WINDOW == 60
+        assert MIN_OVERLAP_BETA == 40
+        assert WARN_OVERLAP_BETA == 50
         assert MIN_R2_GOOD == 0.20
 
         # Ensure thresholds are ordered correctly
-        assert MIN_OVERLAP_BETA < WARN_OVERLAP_BETA
+        assert MIN_OVERLAP_BETA < WARN_OVERLAP_BETA <= BETA_WINDOW
         assert 0 < MIN_R2_GOOD < 1
