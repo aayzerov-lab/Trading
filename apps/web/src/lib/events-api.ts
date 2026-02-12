@@ -47,6 +47,20 @@ export interface EventStats {
   high_priority: number;
 }
 
+// ---- Helpers --------------------------------------------------------------
+
+/** The API stores tickers / reason_codes as JSON text.  Parse them into arrays. */
+function normaliseEvent(raw: Record<string, unknown>): Event {
+  const e = raw as unknown as Event;
+  if (typeof e.tickers === 'string') {
+    try { (e as any).tickers = JSON.parse(e.tickers as unknown as string); } catch { (e as any).tickers = null; }
+  }
+  if (typeof e.reason_codes === 'string') {
+    try { (e as any).reason_codes = JSON.parse(e.reason_codes as unknown as string); } catch { (e as any).reason_codes = null; }
+  }
+  return e;
+}
+
 // ---- Fetchers -------------------------------------------------------------
 
 export async function fetchEvents(params?: {
@@ -69,7 +83,8 @@ export async function fetchEvents(params?: {
   if (!res.ok) {
     throw new Error(`Failed to fetch events: ${res.status} ${res.statusText}`);
   }
-  return res.json();
+  const rows: Record<string, unknown>[] = await res.json();
+  return rows.map(normaliseEvent);
 }
 
 export async function fetchHighPriorityEvents(limit: number = 20): Promise<Event[]> {
@@ -77,7 +92,8 @@ export async function fetchHighPriorityEvents(limit: number = 20): Promise<Event
   if (!res.ok) {
     throw new Error(`Failed to fetch high-priority events: ${res.status} ${res.statusText}`);
   }
-  return res.json();
+  const rows: Record<string, unknown>[] = await res.json();
+  return rows.map(normaliseEvent);
 }
 
 export async function updateEventStatus(id: string, status: EventStatus): Promise<void> {
