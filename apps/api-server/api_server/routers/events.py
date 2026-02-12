@@ -433,7 +433,7 @@ async def seed_events() -> dict[str, Any]:
         sample_events = [
             {
                 "id": "seed-sec-001",
-                "ts_utc": (now - timedelta(hours=2)).isoformat(),
+                "ts_utc": now - timedelta(hours=2),
                 "type": "SEC_FILING",
                 "tickers": '["AAPL"]',
                 "title": "Apple Inc. 10-K Annual Report Filed",
@@ -447,7 +447,7 @@ async def seed_events() -> dict[str, Any]:
             },
             {
                 "id": "seed-sec-002",
-                "ts_utc": (now - timedelta(hours=5)).isoformat(),
+                "ts_utc": now - timedelta(hours=5),
                 "type": "SEC_FILING",
                 "tickers": '["TSLA"]',
                 "title": "Tesla 8-K Current Report: Material Event",
@@ -461,7 +461,7 @@ async def seed_events() -> dict[str, Any]:
             },
             {
                 "id": "seed-macro-001",
-                "ts_utc": (now - timedelta(hours=12)).isoformat(),
+                "ts_utc": now - timedelta(hours=12),
                 "type": "MACRO_SCHEDULE",
                 "tickers": None,
                 "title": "FOMC Rate Decision Announcement",
@@ -475,7 +475,7 @@ async def seed_events() -> dict[str, Any]:
             },
             {
                 "id": "seed-rss-001",
-                "ts_utc": (now - timedelta(hours=1)).isoformat(),
+                "ts_utc": now - timedelta(hours=1),
                 "type": "RSS_NEWS",
                 "tickers": '["NVDA","AMD"]',
                 "title": "Semiconductor stocks surge on AI demand forecast",
@@ -489,7 +489,7 @@ async def seed_events() -> dict[str, Any]:
             },
             {
                 "id": "seed-rss-002",
-                "ts_utc": (now - timedelta(days=1)).isoformat(),
+                "ts_utc": now - timedelta(days=1),
                 "type": "RSS_NEWS",
                 "tickers": '["SPY","QQQ"]',
                 "title": "Market volatility spikes on geopolitical tensions",
@@ -505,7 +505,7 @@ async def seed_events() -> dict[str, Any]:
 
         sample_alerts = [
             {
-                "ts_utc": (now - timedelta(hours=1)).isoformat(),
+                "ts_utc": now - timedelta(hours=1),
                 "type": "HIGH_SEVERITY_EVENT",
                 "message": "High-severity event: FOMC Rate Decision Announcement (score: 95)",
                 "severity": 95,
@@ -513,7 +513,7 @@ async def seed_events() -> dict[str, Any]:
                 "status": "NEW",
             },
             {
-                "ts_utc": (now - timedelta(hours=3)).isoformat(),
+                "ts_utc": now - timedelta(hours=3),
                 "type": "HIGH_SEVERITY_EVENT",
                 "message": "High-severity event: Tesla 8-K Material Event (score: 85)",
                 "severity": 85,
@@ -521,7 +521,7 @@ async def seed_events() -> dict[str, Any]:
                 "status": "NEW",
             },
             {
-                "ts_utc": (now - timedelta(hours=6)).isoformat(),
+                "ts_utc": now - timedelta(hours=6),
                 "type": "RISK_SPIKE",
                 "message": "Portfolio VaR increased by 15% in the last 24 hours",
                 "severity": 75,
