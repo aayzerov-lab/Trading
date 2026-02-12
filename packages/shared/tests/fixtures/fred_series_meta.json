@@ -1,0 +1,11 @@
+{
+  "seriess": [
+    {
+      "id": "DGS10",
+      "title": "Market Yield on U.S. Treasury Securities at 10-Year Constant Maturity",
+      "frequency": "Daily",
+      "units": "Percent",
+      "seasonal_adjustment": "Not Seasonally Adjusted"
+    }
+  ]
+}

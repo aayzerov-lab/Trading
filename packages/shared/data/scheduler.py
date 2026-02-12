@@ -207,6 +207,141 @@ async def run_daily_data_update(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2: Event sync pipeline (EDGAR, schedules, RSS, scoring, alerts)
+# ---------------------------------------------------------------------------
+
+
+async def run_event_sync(
+    engine: AsyncEngine,
+    redis_client: Any = None,
+) -> dict[str, Any]:
+    """Run the full event sync pipeline.
+
+    Steps:
+    1. Sync EDGAR SEC filings for portfolio tickers
+    2. Sync macro economic schedule events
+    3. Sync curated RSS feeds
+    4. Run portfolio-aware materiality scoring
+    5. Optionally summarise high-priority events (if OPENAI_API_KEY set)
+    6. Evaluate alert rules and generate notifications
+    7. Cleanup expired snoozes
+
+    All steps degrade gracefully — a failure in one connector does not
+    prevent others from running.
+    """
+    logger.info("event_sync_started")
+    stats: dict[str, Any] = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "edgar": None,
+        "schedules": None,
+        "rss": None,
+        "scoring": None,
+        "summarizer": None,
+        "alerts": None,
+        "snoozes_cleared": 0,
+        "errors": [],
+    }
+
+    # Step 1: EDGAR SEC filings
+    try:
+        from .edgar import sync_edgar_events
+
+        edgar_stats = await sync_edgar_events(engine=engine)
+        stats["edgar"] = edgar_stats
+        logger.info("event_sync_edgar_done", **edgar_stats)
+    except Exception as e:
+        logger.error("event_sync_edgar_error", error=str(e), exc_info=True)
+        stats["errors"].append(f"edgar: {e}")
+
+    # Step 2: Macro schedule
+    try:
+        from .schedules import sync_macro_schedule
+
+        schedule_stats = await sync_macro_schedule(engine=engine)
+        stats["schedules"] = schedule_stats
+        logger.info("event_sync_schedules_done", **schedule_stats)
+    except Exception as e:
+        logger.error("event_sync_schedules_error", error=str(e), exc_info=True)
+        stats["errors"].append(f"schedules: {e}")
+
+    # Step 3: RSS feeds
+    try:
+        from .rss_feeds import sync_rss_feeds
+
+        rss_stats = await sync_rss_feeds(engine=engine)
+        stats["rss"] = rss_stats
+        logger.info("event_sync_rss_done", **rss_stats)
+    except Exception as e:
+        logger.error("event_sync_rss_error", error=str(e), exc_info=True)
+        stats["errors"].append(f"rss: {e}")
+
+    # Step 4: Portfolio-aware materiality scoring
+    try:
+        from .scoring import score_new_events
+
+        scoring_stats = await score_new_events(engine=engine)
+        stats["scoring"] = scoring_stats
+        logger.info("event_sync_scoring_done", **scoring_stats)
+    except Exception as e:
+        logger.error("event_sync_scoring_error", error=str(e), exc_info=True)
+        stats["errors"].append(f"scoring: {e}")
+
+    # Step 5: Optional LLM summarisation
+    try:
+        from .summarizer import summarize_events
+
+        summarizer_stats = await summarize_events(engine=engine)
+        stats["summarizer"] = summarizer_stats
+        logger.info("event_sync_summarizer_done", **summarizer_stats)
+    except Exception as e:
+        logger.error("event_sync_summarizer_error", error=str(e), exc_info=True)
+        stats["errors"].append(f"summarizer: {e}")
+
+    # Step 6: Alert rules
+    try:
+        from .alert_rules import run_alert_rules
+
+        alert_stats = await run_alert_rules(engine=engine)
+        stats["alerts"] = alert_stats
+        logger.info("event_sync_alerts_done", **alert_stats)
+    except Exception as e:
+        logger.error("event_sync_alerts_error", error=str(e), exc_info=True)
+        stats["errors"].append(f"alerts: {e}")
+
+    # Step 7: Cleanup expired snoozes
+    try:
+        from .alert_rules import cleanup_expired_snoozes
+
+        cleared = await cleanup_expired_snoozes(engine=engine)
+        stats["snoozes_cleared"] = cleared
+    except Exception as e:
+        logger.error("event_sync_snooze_cleanup_error", error=str(e), exc_info=True)
+        stats["errors"].append(f"snooze_cleanup: {e}")
+
+    # Publish event to Redis
+    if redis_client:
+        try:
+            event = {
+                "event": "events_synced",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "stats": {
+                    k: v for k, v in stats.items()
+                    if k not in ("errors",)
+                },
+            }
+            await redis_client.publish(
+                "trading:events",
+                json.dumps(event, default=str),
+            )
+        except Exception as e:
+            stats["errors"].append(f"redis_publish: {e}")
+
+    stats["completed_at"] = datetime.now(timezone.utc).isoformat()
+    logger.info("event_sync_completed", error_count=len(stats["errors"]))
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Risk recomputation triggers
 # ---------------------------------------------------------------------------
 
@@ -325,6 +460,7 @@ async def run_daily_jobs(
         "started_at": datetime.now(timezone.utc).isoformat(),
         "data_update": None,
         "risk_check": None,
+        "event_sync": None,
     }
 
     # Run data update
@@ -345,6 +481,14 @@ async def run_daily_jobs(
     except Exception as e:
         logger.error("risk_recompute_check_failed", error=str(e), exc_info=True)
         results["risk_check"] = {"error": str(e)}
+
+    # Phase 2: Event sync (EDGAR, schedules, RSS, scoring, alerts)
+    try:
+        event_sync_result = await run_event_sync(engine, redis_client)
+        results["event_sync"] = event_sync_result
+    except Exception as e:
+        logger.error("event_sync_failed", error=str(e), exc_info=True)
+        results["event_sync"] = {"error": str(e)}
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
     logger.info("daily_jobs_completed")

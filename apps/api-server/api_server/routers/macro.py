@@ -12,7 +12,9 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, HTTPException
 
+from api_server.config import get_settings
 from shared.data.fred import compute_macro_overview, get_fred_from_db, FRED_SERIES
+from shared.data.macro_service import get_macro_summary
 
 logger = structlog.get_logger()
 
@@ -96,3 +98,26 @@ def _get_unit(series_id: str) -> str:
         "INDPRO": "Index",
     }
     return units.get(series_id, "")
+
+
+@router.get("/summary")
+async def macro_summary() -> dict[str, Any]:
+    """Return macro summary tiles grouped by category from FRED-only data."""
+    try:
+        logger.info("macro_summary_request")
+        settings = get_settings()
+        if not settings.FRED_API_KEY:
+            logger.warning("macro_summary_missing_api_key")
+            return {"generated_at": date.today().isoformat(), "categories": []}
+        summary = await get_macro_summary(settings.FRED_API_KEY)
+        logger.info(
+            "macro_summary_computed",
+            categories=len(summary.get("categories", [])),
+        )
+        return summary
+    except Exception as e:
+        logger.exception("macro_summary_failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Macro summary computation failed: {str(e)}",
+        )

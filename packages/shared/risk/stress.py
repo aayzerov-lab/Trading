@@ -50,7 +50,6 @@ FACTOR_SHOCKS = {
         'name': 'Rates Spike',
         'shocks': {
             'TLT': -0.05,
-            'IEF': -0.03,
             'HYG': -0.05,
         },
     },
@@ -64,7 +63,7 @@ FACTOR_SHOCKS = {
         'name': 'Commodity Spike',
         'shocks': {
             'USO': 0.15,
-            'DBC': 0.10,
+            'DBC': 0.15,
         },
     },
     'crypto_crash': {
@@ -77,10 +76,11 @@ FACTOR_SHOCKS = {
         'name': 'Combined Stress',
         'shocks': {
             'SPY': -0.10,
-            'TLT': -0.05,
+            'TLT': 0.05,
             'HYG': -0.05,
             'UUP': 0.03,
-            'USO': 0.15,
+            'USO': -0.15,
+            'DBC': -0.15,
             'BTC-USD': -0.15,
         },
     },
@@ -94,6 +94,40 @@ BETA_WINDOW = 60             # Rolling window for beta estimation (trading days)
 MIN_OVERLAP_BETA = 40        # Minimum overlap for valid beta
 WARN_OVERLAP_BETA = 50       # Overlap threshold for "Good" quality
 MIN_R2_GOOD = 0.20          # R\u00b2 threshold for "Good" quality
+
+def _orthogonalize_factors(
+    factor_df: pd.DataFrame,
+    factors: List[str],
+) -> Dict[str, np.ndarray]:
+    """Orthogonalize each factor against all others.
+
+    Returns residual series for each factor to reduce multicollinearity.
+    Falls back to raw factor returns if regression fails.
+    """
+    residuals: Dict[str, np.ndarray] = {}
+    if len(factors) <= 1:
+        for f in factors:
+            residuals[f] = factor_df[f].values
+        return residuals
+
+    for f in factors:
+        y = factor_df[f].values
+        others = [o for o in factors if o != f]
+        X = factor_df[others].values
+        if X.size == 0:
+            residuals[f] = y
+            continue
+
+        # Add intercept to avoid bias from non-zero means.
+        X_design = np.column_stack([np.ones(len(y)), X])
+        try:
+            beta, _, _, _ = np.linalg.lstsq(X_design, y, rcond=None)
+            y_hat = X_design @ beta
+            residuals[f] = y - y_hat
+        except Exception:
+            residuals[f] = y
+
+    return residuals
 
 
 def historical_stress_test(
@@ -448,12 +482,32 @@ def factor_stress_test(
     position_returns_aligned = position_returns.loc[common_dates].iloc[-BETA_WINDOW:]
     factor_returns_aligned = factor_returns.loc[common_dates].iloc[-BETA_WINDOW:]
 
+    shocked_factors = [f for f in shocks.keys() if f in factor_returns_aligned.columns]
+    if not shocked_factors:
+        logger.warning(
+            "factor_stress_test: no shocked factors in returns data",
+            scenario=scenario_name
+        )
+        return None
+
+    factor_window = factor_returns_aligned[shocked_factors].dropna()
+    if factor_window.empty:
+        logger.warning(
+            "factor_stress_test: no usable factor data after dropna",
+            scenario=scenario_name
+        )
+        return None
+
+    position_returns_window = position_returns_aligned.loc[factor_window.index]
+    orthogonal_factors = _orthogonalize_factors(factor_window, shocked_factors)
+    orthogonalized = len(shocked_factors) > 1
+
     # Compute betas for each position against each shocked factor (Phase 1.5: with diagnostics)
     position_impacts = {}
     regression_diagnostics = {}  # Phase 1.5: store diagnostics per position
 
     for symbol in symbols:
-        if symbol not in position_returns_aligned.columns:
+        if symbol not in position_returns_window.columns:
             logger.warning(
                 "factor_stress_test: symbol not in position returns",
                 symbol=symbol,
@@ -461,21 +515,34 @@ def factor_stress_test(
             )
             continue
 
-        position_ret = position_returns_aligned[symbol].values
+        position_ret = position_returns_window[symbol].values
         total_impact = 0.0
         symbol_diags = {}
 
         for factor_symbol, shock in shocks.items():
-            if factor_symbol not in factor_returns_aligned.columns:
+            if factor_symbol not in orthogonal_factors:
                 continue
 
-            factor_ret = factor_returns_aligned[factor_symbol].values
-            overlap = len(factor_ret)
+            factor_ret = orthogonal_factors[factor_symbol]
+            if len(position_ret) != len(factor_ret):
+                min_len = min(len(position_ret), len(factor_ret))
+                position_ret_use = position_ret[-min_len:]
+                factor_ret_use = factor_ret[-min_len:]
+                overlap = min_len
+            else:
+                position_ret_use = position_ret
+                factor_ret_use = factor_ret
+                overlap = len(factor_ret)
 
-            diag = compute_regression_diagnostics(position_ret, factor_ret, overlap)
+            diag = compute_regression_diagnostics(position_ret_use, factor_ret_use, overlap)
+            diag["orthogonalized"] = orthogonalized
+            if orthogonalized:
+                diag["orthogonalized_against"] = [
+                    other for other in shocked_factors if other != factor_symbol
+                ]
             symbol_diags[factor_symbol] = diag
 
-            # For invalid betas, set impact to 0 (flagged in diagnostics)
+            # Exclude only invalid betas (allow weak)
             if diag["quality"] == "invalid":
                 logger.warning(
                     "factor_stress_test: invalid beta excluded",
@@ -486,7 +553,14 @@ def factor_stress_test(
                 )
                 continue
 
-            impact = diag["beta"] * shock
+            # Cap beta to avoid extreme leverage from noisy factors
+            beta_raw = diag["beta"]
+            beta_used = float(np.clip(beta_raw, -5.0, 5.0))
+            if beta_used != beta_raw:
+                diag["beta_capped"] = True
+            diag["beta_used"] = beta_used
+
+            impact = beta_used * shock
             total_impact += impact
 
         position_impacts[symbol] = total_impact
@@ -561,7 +635,7 @@ def factor_stress_test(
             weight = weights[idx]
             diag = regression_diagnostics.get(symbol, {}).get(factor_symbol, {})
             if diag.get("quality") != "invalid":
-                portfolio_beta += weight * diag.get("beta", 0.0)
+                portfolio_beta += weight * diag.get("beta_used", diag.get("beta", 0.0))
         factor_exposures[f"portfolio_beta_{factor_symbol}"] = float(portfolio_beta)
 
     result = {
@@ -573,6 +647,11 @@ def factor_stress_test(
         'by_sector': by_sector,
         'factor_exposures': factor_exposures,
         'regression_diagnostics': regression_diagnostics,
+        'factor_orthogonalization': {
+            'enabled': orthogonalized,
+            'factors': shocked_factors,
+            'window': int(len(factor_window)),
+        },
     }
 
     logger.info(

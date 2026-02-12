@@ -147,3 +147,63 @@ security_overrides = Table(
     Column("fx_pair", String, nullable=True),
     Column("updated_at", DateTime(timezone=True), nullable=True),
 )
+
+# ---------------------------------------------------------------------------
+# Events – ingested from SEC/EDGAR, FRED schedule, RSS feeds, etc. (Phase 2)
+# ---------------------------------------------------------------------------
+
+events = Table(
+    "events",
+    phase1_metadata,
+    Column("id", String, primary_key=True),
+    Column("ts_utc", DateTime(timezone=True), nullable=False),
+    Column("type", String, nullable=False),
+    Column("tickers", Text, nullable=True),
+    Column("title", Text, nullable=False),
+    Column("source_name", String, nullable=True),
+    Column("source_url", Text, nullable=True),
+    Column("raw_text_snippet", Text, nullable=True),
+    Column("severity_score", Integer, server_default=text("0")),
+    Column("reason_codes", Text, nullable=True),
+    Column("llm_summary", Text, nullable=True),
+    Column("status", String, nullable=False, server_default=text("'NEW'")),
+    Column("metadata_json", Text, nullable=True),
+    Column("created_at_utc", DateTime(timezone=True), server_default=text("now()")),
+    Column("updated_at_utc", DateTime(timezone=True), server_default=text("now()")),
+)
+
+# ---------------------------------------------------------------------------
+# Event sync tracking – per-connector watermark (Phase 2)
+# ---------------------------------------------------------------------------
+
+event_sync_status = Table(
+    "event_sync_status",
+    phase1_metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("connector", String, nullable=False),
+    Column("sync_key", String, nullable=False),
+    Column("last_sync_at", DateTime(timezone=True), nullable=True),
+    Column("last_item_ts", DateTime(timezone=True), nullable=True),
+    Column("items_fetched", Integer, server_default=text("0")),
+    Column("error_count", Integer, server_default=text("0")),
+    Column("last_error", Text, nullable=True),
+    UniqueConstraint("connector", "sync_key", name="uq_event_sync_connector_key"),
+)
+
+# ---------------------------------------------------------------------------
+# Alerts – surfaced to the UI from event scoring / risk spikes (Phase 2)
+# ---------------------------------------------------------------------------
+
+alerts = Table(
+    "alerts",
+    phase1_metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts_utc", DateTime(timezone=True), nullable=False),
+    Column("type", String, nullable=False),
+    Column("message", Text, nullable=False),
+    Column("severity", Integer, server_default=text("50")),
+    Column("related_event_id", String, nullable=True),
+    Column("status", String, nullable=False, server_default=text("'NEW'")),
+    Column("snoozed_until", DateTime(timezone=True), nullable=True),
+    Column("created_at_utc", DateTime(timezone=True), server_default=text("now()")),
+)

@@ -24,7 +24,7 @@ import {
   CorrelationPair,
   ClusterInfo,
   StressTests,
-  MacroOverview,
+  MacroSummary,
   DataQualityPack,
   RiskMetadata,
   fetchRiskSummary,
@@ -43,6 +43,8 @@ import CorrelationPanel from "@/components/CorrelationPanel";
 import ClustersPanel from "@/components/ClustersPanel";
 import StressPanel from "@/components/StressPanel";
 import MacroStrip from "@/components/MacroStrip";
+import EventsPanel from "@/components/EventsPanel";
+import NotificationCenter from "@/components/NotificationCenter";
 import DataQualityPanel from "@/components/DataQualityPanel";
 import RiskMetadataPanel from "@/components/RiskMetadataPanel";
 
@@ -164,7 +166,7 @@ function fmtPct(v: number | null | undefined): string {
   return `${s}${v.toFixed(1)}%`;
 }
 
-function fmtTimestampUTC(iso: string | null): string {
+function fmtTimestampET(iso: string | null): string {
   if (!iso) return "\u2014";
   try {
     const d = new Date(iso);
@@ -173,8 +175,8 @@ function fmtTimestampUTC(iso: string | null): string {
       minute: "2-digit",
       second: "2-digit",
       hour12: false,
-      timeZone: "UTC",
-    }) + " UTC";
+      timeZone: "America/New_York",
+    }) + " ET";
   } catch {
     return iso;
   }
@@ -187,7 +189,7 @@ function fmtTimestampUTC(iso: string | null): string {
 type WsStatus = "connected" | "disconnected" | "reconnecting";
 type WeightingMethod = "market_value" | "cost_basis";
 type SortDir = "asc" | "desc";
-type TabName = "overview" | "risk" | "stress" | "macro";
+type TabName = "overview" | "risk" | "stress" | "macro" | "events";
 
 interface ColumnDef {
   key: string;
@@ -285,7 +287,7 @@ export default function DashboardPage() {
   const [stressLoading, setStressLoading] = useState(false);
 
   // Macro tab state
-  const [macroData, setMacroData] = useState<MacroOverview | null>(null);
+  const [macroData, setMacroData] = useState<MacroSummary | null>(null);
   const [macroLoading, setMacroLoading] = useState(false);
 
   // Sort state
@@ -747,7 +749,8 @@ export default function DashboardPage() {
           <span className="header-title">Trading Workstation</span>
         </div>
         <div className="header-meta">
-          {lastUpdate && <span>{fmtTimestampUTC(lastUpdate)}</span>}
+          <NotificationCenter />
+          {lastUpdate && <span>{fmtTimestampET(lastUpdate)}</span>}
           <span className="status-indicator">
             <span className={`status-dot ${wsStatus}`} />
             {wsStatus === "connected"
@@ -786,6 +789,12 @@ export default function DashboardPage() {
           onClick={() => setActiveTab("macro")}
         >
           Macro
+        </button>
+        <button
+          className={`tab-btn${activeTab === "events" ? " active" : ""}`}
+          onClick={() => setActiveTab("events")}
+        >
+          Events
         </button>
       </nav>
 
@@ -1069,6 +1078,13 @@ export default function DashboardPage() {
       {activeTab === "macro" && (
         <div className="tab-content">
           <MacroStrip macroData={macroData} loading={macroLoading} />
+        </div>
+      )}
+
+      {/* Events Tab */}
+      {activeTab === "events" && (
+        <div className="tab-content">
+          <EventsPanel />
         </div>
       )}
     </div>

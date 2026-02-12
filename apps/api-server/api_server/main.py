@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api_server.config import get_settings
 from api_server.db import close_engine, get_account_summary, get_engine, get_positions
 from api_server.exposures import compute_exposures
-from api_server.routers import macro, risk
+from api_server.routers import events, macro, risk
 
 logger = structlog.get_logger()
 
@@ -207,6 +207,7 @@ app.add_middleware(
 # Include routers
 app.include_router(risk.router)
 app.include_router(macro.router)
+app.include_router(events.router)
 
 
 # ---------------------------------------------------------------------------

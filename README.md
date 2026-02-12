@@ -119,6 +119,24 @@ open http://localhost:3000
 
    Should return a JSON array of your current positions.
 
+---
+
+## Adding A Macro Tile
+
+Macro tiles are configured in a single file:
+
+- `packages/shared/data/macro_series.py`
+
+To add a new tile:
+
+1. Add a new `MacroSeriesConfig` entry to `MACRO_SERIES`.
+2. For a direct FRED series, set `fred_series_id`.
+3. For a computed series (e.g., a spread), set `series_ids` and `computed="spread"`.
+4. Choose `category`, `format`, `recommended_change_windows`, and `refresh_policy`.
+5. If the series is only used as an input, set `display=False`.
+
+The Macro tab will automatically pick up the change after rebuild.
+
 4. **Dashboard:**
 
    Open [http://localhost:3000](http://localhost:3000) in your browser. You should see a positions table and sector/country allocation pie charts.

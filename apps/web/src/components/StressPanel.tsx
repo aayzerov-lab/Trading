@@ -23,6 +23,17 @@ function fmtPct(v: number): string {
   return `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
 }
 
+// Factor shock descriptions per scenario key
+const SCENARIO_SHOCKS: Record<string, string> = {
+  equity_crash: "SPY −10%",
+  rates_up: "TLT −5%, HYG −5%",
+  usd_rally: "UUP +3%",
+  commodity_spike: "USO +15%, DBC +15%",
+  crypto_crash: "BTC −15%",
+  combined_stress:
+    "SPY −10%, TLT +5%, HYG −5%, UUP +3%, USO −15%, DBC −15%, BTC −15%",
+};
+
 interface StressCardProps {
   scenario: string;
   result: StressResult;
@@ -30,6 +41,7 @@ interface StressCardProps {
 
 function StressCard({ scenario, result }: StressCardProps) {
   const [expanded, setExpanded] = useState(false);
+  const shockDesc = SCENARIO_SHOCKS[scenario];
 
   return (
     <div className="stress-card">
@@ -37,6 +49,7 @@ function StressCard({ scenario, result }: StressCardProps) {
         <div className="stress-scenario">{scenario}</div>
         {result.period && <div className="stress-period">{result.period}</div>}
       </div>
+      {shockDesc && <div className="stress-shock-desc">{shockDesc}</div>}
       <div
         className={`stress-pnl${result.portfolio_pnl >= 0 ? " positive" : " negative"}`}
       >

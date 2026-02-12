@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
     FRED_API_KEY: str = ""  # Optional, needed for FRED data fetching
+    OPENAI_API_KEY: str = ""  # Optional, gated LLM summariser for high-priority events
+    EDGAR_USER_AGENT: str = "TradingWorkstation admin@localhost"  # SEC EDGAR User-Agent
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

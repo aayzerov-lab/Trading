@@ -72,20 +72,35 @@ export interface StressTests {
   computed_at: string;
 }
 
-export interface MacroIndicator {
-  series_id: string;
-  name: string;
-  latest_value: number;
-  latest_date: string;
-  change_1m: number | null;
-  change_3m: number | null;
-  direction: 'up' | 'down' | 'flat';
+export interface MacroTile {
+  id: string;
+  label: string;
+  format: string;
+  value: number;
+  valueFormatted: string;
   unit: string;
+  obs_date: string;
+  fetched_at: string;
+  realtime_start: string | null;
+  realtime_end: string | null;
+  changes: Record<string, number | null>;
+  changeDirection: 'up' | 'down' | 'flat';
+  revised: boolean;
+  previousValue: number | null;
+  description: string;
+  category: string;
+  recommendedChangeWindows: string[];
+  dataQuality: 'daily' | 'release';
 }
 
-export interface MacroOverview {
-  indicators: MacroIndicator[];
-  computed_at: string;
+export interface MacroCategory {
+  name: string;
+  tiles: MacroTile[];
+}
+
+export interface MacroSummary {
+  generated_at: string;
+  categories: MacroCategory[];
 }
 
 // ---- Fetchers -------------------------------------------------------------
@@ -149,8 +164,8 @@ export async function fetchStressTests(): Promise<StressTests> {
   return res.json();
 }
 
-export async function fetchMacroOverview(): Promise<MacroOverview> {
-  const res = await fetch(`${API_URL}/macro/overview`);
+export async function fetchMacroOverview(): Promise<MacroSummary> {
+  const res = await fetch(`${API_URL}/macro/summary`);
   if (!res.ok) {
     throw new Error(`Failed to fetch macro overview: ${res.status} ${res.statusText}`);
   }
