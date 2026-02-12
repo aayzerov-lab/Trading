@@ -21,7 +21,7 @@ from sqlalchemy import text
 
 from shared.data.fx import get_fx_rates_from_db, get_security_fx_info
 from shared.data.scheduler import compute_portfolio_hash
-from shared.data.yahoo import get_prices_from_db, FACTOR_SYMBOLS
+from shared.data.yahoo import fetch_prices_yahoo, get_prices_from_db, FACTOR_SYMBOLS
 from shared.db.engine import get_shared_engine
 from shared.risk.covariance import estimate_covariance, pairwise_cov
 from shared.risk.correlation import (
@@ -234,6 +234,27 @@ async def compute_risk_pack(
             start_date=start_date,
             table="prices_daily",
         )
+
+        # Auto-fetch prices for any new symbols missing from the DB
+        missing = [s for s in symbols if s not in position_prices]
+        if missing:
+            logger.info("fetching_missing_prices", symbols=missing)
+            try:
+                engine = get_shared_engine()
+                fetched = await fetch_prices_yahoo(
+                    symbols=missing, engine=engine, is_factor=False,
+                )
+                if fetched:
+                    # Re-read from DB so format matches
+                    extra = await get_prices_from_db(
+                        symbols=list(fetched.keys()),
+                        start_date=start_date,
+                        table="prices_daily",
+                    )
+                    position_prices.update(extra)
+            except Exception:
+                logger.warning("auto_fetch_prices_failed", symbols=missing, exc_info=True)
+
         factor_prices = await get_prices_from_db(
             symbols=FACTOR_SYMBOLS,
             start_date=start_date,

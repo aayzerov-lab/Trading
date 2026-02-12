@@ -264,7 +264,7 @@ async def run_event_sync(
         logger.error("event_sync_schedules_error", error=str(e), exc_info=True)
         stats["errors"].append(f"schedules: {e}")
 
-    # Step 3: RSS feeds
+    # Step 3: RSS feeds (curated)
     try:
         from .rss_feeds import sync_rss_feeds
 
@@ -274,6 +274,10 @@ async def run_event_sync(
     except Exception as e:
         logger.error("event_sync_rss_error", error=str(e), exc_info=True)
         stats["errors"].append(f"rss: {e}")
+
+    # Step 3b: Per-ticker Google News RSS — skipped here because the
+    # dedicated _run_ticker_news_loop (every 60s) handles this independently.
+    # Running it again would waste Google API calls and is redundant.
 
     # Step 4: Portfolio-aware materiality scoring
     try:

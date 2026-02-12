@@ -34,17 +34,17 @@ logger = structlog.get_logger()
 # ---------------------------------------------------------------------------
 
 _TIER_CRITICAL = 85
-_TIER_HIGH = 70
+_TIER_HIGH = 75
 _TIER_MEDIUM = 50
 
 # ---------------------------------------------------------------------------
 # Booster constants
 # ---------------------------------------------------------------------------
 
-_BOOST_DIRECT_HOLDING = 15
+_BOOST_DIRECT_HOLDING = 0  # No boost for merely holding — scope=my already filters to portfolio
 _BOOST_LARGE_POSITION = 10  # additional if weight > 5%
 _BOOST_HIGH_VOL = 5         # annualised vol > 40%
-_BOOST_SECTOR_CONCENTRATION = 8  # sector weight > 20%
+_BOOST_SECTOR_CONCENTRATION = 5  # sector weight > 20%
 _BOOST_CORRELATED_CLUSTER = 5
 _BOOST_UPCOMING_EXPIRY = 10  # option expires within 7 days (future)
 

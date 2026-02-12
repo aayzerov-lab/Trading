@@ -6,3 +6,4 @@ pydantic
 pydantic-settings
 structlog
 greenlet
+tzdata

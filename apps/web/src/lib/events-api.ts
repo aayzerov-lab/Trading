@@ -163,3 +163,33 @@ export async function seedEvents(): Promise<{ seeded: boolean; events: number; a
   }
   return res.json();
 }
+
+// ---- Keyword watchlist ----------------------------------------------------
+
+export interface Keyword {
+  id: number;
+  keyword: string;
+  enabled: number;
+  created_at_utc: string;
+}
+
+export async function fetchKeywords(): Promise<Keyword[]> {
+  const res = await fetch(`${API_URL}/events/keywords`);
+  if (!res.ok) throw new Error(`Failed to fetch keywords: ${res.status}`);
+  return res.json();
+}
+
+export async function addKeyword(keyword: string): Promise<{ ok: boolean; id?: number; keyword?: string }> {
+  const res = await fetch(`${API_URL}/events/keywords`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keyword }),
+  });
+  if (!res.ok) throw new Error(`Failed to add keyword: ${res.status}`);
+  return res.json();
+}
+
+export async function deleteKeyword(id: number): Promise<void> {
+  const res = await fetch(`${API_URL}/events/keywords/${id}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(`Failed to delete keyword: ${res.status}`);
+}

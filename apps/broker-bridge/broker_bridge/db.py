@@ -24,7 +24,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from broker_bridge.models import PositionEvent
+from broker_bridge.models import ExecutionEvent, PositionEvent
 
 logger = structlog.get_logger()
 
@@ -50,6 +50,7 @@ positions_current = Table(
     Column("market_value", Float, nullable=True),
     Column("unrealized_pnl", Float, nullable=True),
     Column("realized_pnl", Float, nullable=True),
+    Column("daily_pnl", Float, nullable=True),
     Column("sector", String, nullable=False, server_default=text("'Unknown'")),
     Column("country", String, nullable=False, server_default=text("'Unknown'")),
     Column("ib_industry", String, nullable=True),
@@ -96,6 +97,7 @@ positions_events = Table(
     Column("market_value", Float, nullable=True),
     Column("unrealized_pnl", Float, nullable=True),
     Column("realized_pnl", Float, nullable=True),
+    Column("daily_pnl", Float, nullable=True),
     Column("sector", String, nullable=False, server_default=text("'Unknown'")),
     Column("country", String, nullable=False, server_default=text("'Unknown'")),
     Column("ib_industry", String, nullable=True),
@@ -137,6 +139,36 @@ account_summary_events = Table(
     ),
 )
 
+executions = Table(
+    "executions",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("exec_id", String, nullable=False),
+    Column("account", String, nullable=False),
+    Column("conid", Integer, nullable=True),
+    Column("symbol", String, nullable=False),
+    Column("sec_type", String, nullable=False),
+    Column("currency", String, nullable=False),
+    Column("exchange", String, nullable=True),
+    Column("side", String, nullable=False),
+    Column("order_type", String, nullable=False),
+    Column("quantity", Float, nullable=False),
+    Column("filled_qty", Float, nullable=False, server_default=text("0")),
+    Column("avg_fill_price", Float, nullable=True),
+    Column("lmt_price", Float, nullable=True),
+    Column("commission", Float, nullable=True),
+    Column("status", String, nullable=False),
+    Column("order_ref", String, nullable=True),
+    Column("exec_time", DateTime(timezone=True), nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    ),
+    UniqueConstraint("exec_id", name="uq_executions_exec_id"),
+)
+
 # ---------------------------------------------------------------------------
 # Engine singleton
 # ---------------------------------------------------------------------------
@@ -174,6 +206,7 @@ _NEW_POSITION_COLUMNS = [
     ("market_value", "FLOAT"),
     ("unrealized_pnl", "FLOAT"),
     ("realized_pnl", "FLOAT"),
+    ("daily_pnl", "FLOAT"),
     ("ib_industry", "VARCHAR"),
     ("ib_category", "VARCHAR"),
     ("ib_subcategory", "VARCHAR"),
@@ -223,13 +256,13 @@ _UPSERT_WITH_CONID = text("""
     INSERT INTO positions_current
         (account, conid, symbol, sec_type, currency, exchange,
          position, avg_cost, market_price, market_value,
-         unrealized_pnl, realized_pnl,
+         unrealized_pnl, realized_pnl, daily_pnl,
          sector, country, ib_industry, ib_category, ib_subcategory,
          updated_at)
     VALUES
         (:account, :conid, :symbol, :sec_type, :currency, :exchange,
          :position, :avg_cost, :market_price, :market_value,
-         :unrealized_pnl, :realized_pnl,
+         :unrealized_pnl, :realized_pnl, :daily_pnl,
          :sector, :country, :ib_industry, :ib_category, :ib_subcategory,
          :updated_at)
     ON CONFLICT (account, conid) WHERE conid IS NOT NULL
@@ -244,6 +277,7 @@ _UPSERT_WITH_CONID = text("""
         market_value    = COALESCE(EXCLUDED.market_value, positions_current.market_value),
         unrealized_pnl  = COALESCE(EXCLUDED.unrealized_pnl, positions_current.unrealized_pnl),
         realized_pnl    = COALESCE(EXCLUDED.realized_pnl, positions_current.realized_pnl),
+        daily_pnl       = COALESCE(EXCLUDED.daily_pnl, positions_current.daily_pnl),
         sector          = EXCLUDED.sector,
         country         = EXCLUDED.country,
         ib_industry     = COALESCE(EXCLUDED.ib_industry, positions_current.ib_industry),
@@ -256,13 +290,13 @@ _UPSERT_WITHOUT_CONID = text("""
     INSERT INTO positions_current
         (account, conid, symbol, sec_type, currency, exchange,
          position, avg_cost, market_price, market_value,
-         unrealized_pnl, realized_pnl,
+         unrealized_pnl, realized_pnl, daily_pnl,
          sector, country, ib_industry, ib_category, ib_subcategory,
          updated_at)
     VALUES
         (:account, :conid, :symbol, :sec_type, :currency, :exchange,
          :position, :avg_cost, :market_price, :market_value,
-         :unrealized_pnl, :realized_pnl,
+         :unrealized_pnl, :realized_pnl, :daily_pnl,
          :sector, :country, :ib_industry, :ib_category, :ib_subcategory,
          :updated_at)
     ON CONFLICT (account, symbol, sec_type, currency, exchange)
@@ -274,6 +308,7 @@ _UPSERT_WITHOUT_CONID = text("""
         market_value    = COALESCE(EXCLUDED.market_value, positions_current.market_value),
         unrealized_pnl  = COALESCE(EXCLUDED.unrealized_pnl, positions_current.unrealized_pnl),
         realized_pnl    = COALESCE(EXCLUDED.realized_pnl, positions_current.realized_pnl),
+        daily_pnl       = COALESCE(EXCLUDED.daily_pnl, positions_current.daily_pnl),
         sector          = EXCLUDED.sector,
         country         = EXCLUDED.country,
         ib_industry     = COALESCE(EXCLUDED.ib_industry, positions_current.ib_industry),
@@ -286,12 +321,12 @@ _INSERT_EVENT = text("""
     INSERT INTO positions_events
         (ts_utc, account, conid, symbol, sec_type, currency, exchange,
          position, avg_cost, market_price, market_value,
-         unrealized_pnl, realized_pnl,
+         unrealized_pnl, realized_pnl, daily_pnl,
          sector, country, ib_industry, ib_category, ib_subcategory)
     VALUES
         (:ts_utc, :account, :conid, :symbol, :sec_type, :currency, :exchange,
          :position, :avg_cost, :market_price, :market_value,
-         :unrealized_pnl, :realized_pnl,
+         :unrealized_pnl, :realized_pnl, :daily_pnl,
          :sector, :country, :ib_industry, :ib_category, :ib_subcategory)
 """)
 
@@ -316,8 +351,26 @@ _UPDATE_MARKET_VALUES = text("""
         market_value    = :market_value,
         unrealized_pnl  = :unrealized_pnl,
         realized_pnl    = :realized_pnl,
+        daily_pnl       = :daily_pnl,
         updated_at      = :updated_at
     WHERE account = :account AND conid = :conid
+""")
+
+_UPSERT_EXECUTION = text("""
+    INSERT INTO executions
+        (exec_id, account, conid, symbol, sec_type, currency, exchange,
+         side, order_type, quantity, filled_qty, avg_fill_price,
+         lmt_price, commission, status, order_ref, exec_time)
+    VALUES
+        (:exec_id, :account, :conid, :symbol, :sec_type, :currency, :exchange,
+         :side, :order_type, :quantity, :filled_qty, :avg_fill_price,
+         :lmt_price, :commission, :status, :order_ref, :exec_time)
+    ON CONFLICT (exec_id)
+    DO UPDATE SET
+        filled_qty      = EXCLUDED.filled_qty,
+        avg_fill_price  = EXCLUDED.avg_fill_price,
+        commission      = EXCLUDED.commission,
+        status          = EXCLUDED.status
 """)
 
 _UPDATE_ENRICHMENT = text("""
@@ -347,6 +400,7 @@ async def upsert_position(event: PositionEvent) -> None:
         "market_value": event.market_value,
         "unrealized_pnl": event.unrealized_pnl,
         "realized_pnl": event.realized_pnl,
+        "daily_pnl": event.daily_pnl,
         "sector": event.sector,
         "country": event.country,
         "ib_industry": event.ib_industry,
@@ -407,6 +461,7 @@ async def update_market_values(
     market_value: float | None,
     unrealized_pnl: float | None,
     realized_pnl: float | None,
+    daily_pnl: float | None = None,
 ) -> None:
     """Update market value fields on an existing positions_current row."""
     engine = _get_engine("")
@@ -419,6 +474,7 @@ async def update_market_values(
         "market_value": market_value,
         "unrealized_pnl": unrealized_pnl,
         "realized_pnl": realized_pnl,
+        "daily_pnl": daily_pnl,
         "updated_at": now,
     }
 
@@ -446,6 +502,35 @@ async def update_enrichment(
         })
 
     logger.debug("enrichment_updated", conid=conid, sector=sector, country=country)
+
+
+async def upsert_execution(event: ExecutionEvent) -> None:
+    """Upsert an execution into the executions table."""
+    engine = _get_engine("")
+    params: dict[str, Any] = {
+        "exec_id": event.exec_id,
+        "account": event.account,
+        "conid": event.conid,
+        "symbol": event.symbol,
+        "sec_type": event.sec_type,
+        "currency": event.currency,
+        "exchange": event.exchange,
+        "side": event.side,
+        "order_type": event.order_type,
+        "quantity": event.quantity,
+        "filled_qty": event.filled_qty,
+        "avg_fill_price": event.avg_fill_price,
+        "lmt_price": event.lmt_price,
+        "commission": event.commission,
+        "status": event.status,
+        "order_ref": event.order_ref,
+        "exec_time": datetime.fromisoformat(event.exec_time)
+        if isinstance(event.exec_time, str)
+        else event.exec_time,
+    }
+    async with engine.begin() as conn:
+        await conn.execute(_UPSERT_EXECUTION, params)
+    logger.debug("execution_upserted", exec_id=event.exec_id, symbol=event.symbol)
 
 
 # ---------------------------------------------------------------------------

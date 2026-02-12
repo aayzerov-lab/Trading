@@ -32,14 +32,14 @@ logger = structlog.get_logger(__name__)
 
 CURATED_FEEDS: list[dict[str, Any]] = [
     {
-        "name": "Reuters Business",
-        "url": "https://feeds.reuters.com/reuters/businessNews",
+        "name": "MarketWatch Top Stories",
+        "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
         "category": "business",
         "base_severity": 50,
     },
     {
-        "name": "Reuters Markets",
-        "url": "https://feeds.reuters.com/reuters/marketsNews",
+        "name": "MarketWatch Bulletins",
+        "url": "https://feeds.content.dowjones.io/public/rss/mw_bulletins",
         "category": "markets",
         "base_severity": 55,
     },
@@ -62,10 +62,16 @@ CURATED_FEEDS: list[dict[str, Any]] = [
         "base_severity": 55,
     },
     {
-        "name": "WSJ Markets",
-        "url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+        "name": "Investing.com Stock Market",
+        "url": "https://www.investing.com/rss/news_25.rss",
         "category": "markets",
-        "base_severity": 55,
+        "base_severity": 50,
+    },
+    {
+        "name": "NYT Business",
+        "url": "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+        "category": "business",
+        "base_severity": 50,
     },
     {
         "name": "Fed Reserve Press",
@@ -75,7 +81,7 @@ CURATED_FEEDS: list[dict[str, Any]] = [
     },
     {
         "name": "SEC Press Releases",
-        "url": "https://www.sec.gov/rss/news/press.xml",
+        "url": "https://www.sec.gov/news/pressreleases.rss",
         "category": "regulatory",
         "base_severity": 65,
     },
@@ -101,6 +107,11 @@ _TICKER_EXCLUSIONS: set[str] = {
     "CEO", "IPO", "ETF", "GDP", "CPI", "FED", "SEC", "NYSE",
     "FDA", "FBI", "CIA", "USA", "EUR", "USD", "GBP", "JPY",
     "EST", "PST", "CST", "PDT", "EDT",
+    # Common English words that are also real tickers — exclude from bare
+    # matching to avoid false positives (e.g. "net income" → NET).
+    # These tickers are still matched via $NET, (NASDAQ: NET), and
+    # company name aliases ("cloudflare" → NET).
+    "NET", "ARM", "MP",
 }
 
 # Ticker pattern: matches $AAPL, (NASDAQ: AAPL), (NYSE: TSLA), or bare AAPL
@@ -146,6 +157,8 @@ _HARDCODED_ALIASES: dict[str, str] = {
     "denison mines": "DNN", "equinox gold": "EQX",
     "ge vernova": "GEV", "genius sports": "GENI",
     "bitcoin": "BTC", "ethereum": "ETH",
+    # Tickers excluded from bare-word matching — alias them by company name
+    "cloudflare": "NET", "arm holdings": "ARM",
 }
 
 
@@ -612,12 +625,14 @@ def _article_to_event(
     raw_description = article.get("description", "")
     clean_description = _strip_html(raw_description)
 
-    # Severity scoring
+    # Severity scoring — small bump for ticker mentions; the main
+    # differentiation comes from portfolio scoring (large positions,
+    # high vol, sector concentration) applied downstream.
     severity = feed.get("base_severity", 50)
     if len(matched_tickers) == 1:
-        severity = min(severity + 10, 100)
+        severity = min(severity + 5, 100)
     elif len(matched_tickers) > 1:
-        severity = min(severity + 15, 100)
+        severity = min(severity + 8, 100)
 
     # Reason codes
     reason_codes = ["rss_news"]
@@ -690,6 +705,231 @@ async def _get_portfolio_tickers(engine: AsyncEngine) -> set[str]:
 # ---------------------------------------------------------------------------
 # Main sync entry point
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Per-ticker Google News RSS search
+# ---------------------------------------------------------------------------
+
+
+def _build_ticker_news_feeds(
+    portfolio_tickers: set[str],
+) -> list[dict[str, Any]]:
+    """Build per-ticker Google News RSS feed configs.
+
+    For each portfolio ticker, generates a Google News RSS search URL
+    targeting recent stock/financial news for that ticker.
+
+    Args:
+        portfolio_tickers: Set of uppercase ticker symbols.
+
+    Returns:
+        List of feed config dicts compatible with _fetch_feed / _parse_xml_feed.
+    """
+    feeds: list[dict[str, Any]] = []
+
+    # Reverse alias map: ticker -> best company name for search enrichment
+    _ticker_to_name: dict[str, str] = {}
+    for alias, ticker in _HARDCODED_ALIASES.items():
+        # Prefer longer aliases (more specific company names)
+        if ticker not in _ticker_to_name or len(alias) > len(_ticker_to_name[ticker]):
+            _ticker_to_name[ticker] = alias
+
+    for ticker in sorted(portfolio_tickers):
+        # Skip ETFs and indices (they get plenty of coverage from curated feeds)
+        if ticker in {"SPY", "QQQ", "IWM", "DIA", "VXX", "TLT", "GLD", "SLV",
+                       "XLF", "XLE", "XLK", "XLV", "XLI", "XLP", "XLU", "XLB",
+                       "XLRE", "XLC", "BTC", "ETH"}:
+            continue
+
+        # Build search query: "TICKER stock" + optional company name
+        company = _ticker_to_name.get(ticker)
+        if company:
+            query = f"{ticker} OR \"{company}\" stock"
+        else:
+            query = f"{ticker} stock"
+
+        # URL-encode the query
+        from urllib.parse import quote
+        encoded_q = quote(query)
+        url = (
+            f"https://news.google.com/rss/search?"
+            f"q={encoded_q}+when:2d&hl=en-US&gl=US&ceid=US:en"
+        )
+
+        feeds.append({
+            "name": f"Google News: {ticker}",
+            "url": url,
+            "category": "ticker_news",
+            "base_severity": 55,
+            "_ticker": ticker,  # pre-tag with the ticker
+        })
+
+    return feeds
+
+
+async def sync_ticker_news_feeds(
+    engine: AsyncEngine | None = None,
+    lookback_hours: int = 48,
+) -> dict[str, Any]:
+    """Fetch per-ticker Google News RSS and store relevant articles as events.
+
+    This complements the curated RSS feeds by searching for news specifically
+    about each portfolio holding. Articles are always tagged with the
+    searched ticker.
+
+    Args:
+        engine: SQLAlchemy async engine. If None, uses get_shared_engine().
+        lookback_hours: Only store articles published within this many hours.
+
+    Returns:
+        Stats dict with feeds_checked, articles_found, events_inserted, etc.
+    """
+    if engine is None:
+        engine = get_shared_engine()
+
+    stats: dict[str, Any] = {
+        "feeds_checked": 0,
+        "articles_found": 0,
+        "events_inserted": 0,
+        "ticker_matches": 0,
+        "errors": [],
+    }
+
+    # Get portfolio tickers
+    portfolio_tickers = await _get_portfolio_tickers(engine)
+    if not portfolio_tickers:
+        logger.info("ticker_news_sync_no_tickers")
+        return stats
+
+    # Build per-ticker feeds
+    ticker_feeds = _build_ticker_news_feeds(portfolio_tickers)
+    if not ticker_feeds:
+        return stats
+
+    # Also build alias map for additional ticker extraction
+    alias_map = _build_company_alias_map(portfolio_tickers)
+
+    logger.info(
+        "ticker_news_sync_started",
+        feed_count=len(ticker_feeds),
+        portfolio_tickers=len(portfolio_tickers),
+    )
+
+    cutoff_utc = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+
+    # Fetch feeds in batches to avoid overwhelming Google
+    batch_size = 5
+    all_events: list[dict[str, Any]] = []
+
+    for batch_start in range(0, len(ticker_feeds), batch_size):
+        batch = ticker_feeds[batch_start : batch_start + batch_size]
+        feed_results = await asyncio.gather(
+            *[_fetch_feed(feed) for feed in batch],
+            return_exceptions=True,
+        )
+
+        for feed, result in zip(batch, feed_results):
+            stats["feeds_checked"] += 1
+            feed_name = feed["name"]
+            target_ticker = feed.get("_ticker", "")
+
+            if isinstance(result, Exception):
+                stats["errors"].append(f"{feed_name}: {result}")
+                logger.warning("ticker_news_feed_error", feed=feed_name, error=str(result))
+                continue
+
+            articles: list[dict[str, Any]] = result
+            stats["articles_found"] += len(articles)
+
+            for article in articles:
+                # Filter by lookback window
+                pub_date = _parse_rss_date(article.get("published", ""))
+                if pub_date is not None and pub_date < cutoff_utc:
+                    continue
+
+                # Always include the target ticker; also check for other mentions
+                search_text = " ".join(
+                    filter(None, [article.get("title", ""), article.get("description", "")])
+                )
+                additional_tickers = _extract_tickers(search_text, portfolio_tickers, alias_map)
+                matched = sorted(set([target_ticker] + additional_tickers))
+                stats["ticker_matches"] += len(matched)
+
+                event = _article_to_event(article, feed, matched)
+                all_events.append(event)
+
+        # Small delay between batches to be polite to Google
+        if batch_start + batch_size < len(ticker_feeds):
+            await asyncio.sleep(1.0)
+
+    # Bulk upsert
+    if all_events:
+        inserted = await _bulk_upsert_events(engine, all_events)
+        stats["events_inserted"] = inserted
+
+    # Prune old RSS_NEWS events beyond the retention limit
+    # keep=500 and max_age_hours=48 ensures today's curated feed
+    # articles are never deleted by the fast ticker-news loop
+    try:
+        pruned = await prune_old_rss_events(engine)
+        stats["pruned"] = pruned
+    except Exception as e:
+        logger.warning("ticker_news_prune_error", error=str(e))
+        stats["errors"].append(f"prune: {e}")
+
+    logger.info(
+        "ticker_news_sync_completed",
+        feeds_checked=stats["feeds_checked"],
+        articles_found=stats["articles_found"],
+        events_inserted=stats["events_inserted"],
+        ticker_matches=stats["ticker_matches"],
+        pruned=stats.get("pruned", 0),
+        error_count=len(stats["errors"]),
+    )
+
+    return stats
+
+
+async def prune_old_rss_events(
+    engine: AsyncEngine,
+    keep: int = 500,
+    max_age_hours: int = 48,
+) -> int:
+    """Delete RSS_NEWS events that are both old AND beyond the keep limit.
+
+    Only prunes events older than *max_age_hours* to avoid deleting
+    today's curated feed articles. Events within the age window are
+    always retained regardless of the *keep* limit.
+
+    Args:
+        engine: SQLAlchemy async engine.
+        keep: Number of most recent RSS_NEWS events to retain.
+        max_age_hours: Never delete events newer than this many hours.
+
+    Returns:
+        Number of rows deleted.
+    """
+    try:
+        async with engine.begin() as conn:
+            result = await conn.execute(text("""
+                DELETE FROM events
+                WHERE type = 'RSS_NEWS'
+                  AND ts_utc < NOW() - MAKE_INTERVAL(hours => :max_age)
+                  AND id NOT IN (
+                      SELECT id FROM events
+                      WHERE type = 'RSS_NEWS'
+                      ORDER BY ts_utc DESC
+                      LIMIT :keep
+                  )
+            """), {"keep": keep, "max_age": max_age_hours})
+            deleted = result.rowcount
+            if deleted > 0:
+                logger.info("rss_events_pruned", deleted=deleted, kept=keep)
+            return deleted
+    except Exception:
+        logger.error("rss_events_prune_failed", exc_info=True)
+        return 0
 
 
 async def sync_rss_feeds(

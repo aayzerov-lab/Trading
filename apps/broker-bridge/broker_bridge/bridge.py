@@ -14,10 +14,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 import structlog
-from ib_insync import IB, Contract, PortfolioItem, Position, util
+from ib_insync import IB, Contract, Fill, PortfolioItem, Position, Trade, util
 
 from broker_bridge.config import Settings
-from broker_bridge.db import update_enrichment, update_market_values, upsert_account_summary, upsert_position
+from broker_bridge.db import update_enrichment, update_market_values, upsert_account_summary, upsert_execution, upsert_position
 from broker_bridge.enrichment import (
     cache_contract_details,
     enrich,
@@ -26,13 +26,14 @@ from broker_bridge.enrichment import (
     get_manual_override,
     save_contract_cache,
 )
-from broker_bridge.models import PositionEvent
+from broker_bridge.models import ExecutionEvent, PositionEvent
 from broker_bridge.publisher import RedisPublisher
 
 logger = structlog.get_logger()
 
 _REDIS_CHANNEL = "positions"
 _REDIS_ACCT_CHANNEL = "account_summary"
+_REDIS_EXEC_CHANNEL = "executions"
 
 
 class IBBridge:
@@ -48,6 +49,7 @@ class IBBridge:
         self._ib = IB()
         self._shutdown_event = asyncio.Event()
         self._contract_details_fetched: set[int] = set()
+        self._pnl_subscribed_conids: set[int] = set()
         self._refresh_interval = 15  # seconds
 
     # ------------------------------------------------------------------
@@ -310,8 +312,10 @@ class IBBridge:
         """Refresh market value data from IB portfolio.
 
         Reads ib.portfolio() and updates market_price, market_value,
-        unrealized_pnl, realized_pnl in the database.  Also fetches
-        contract details for any new conids not yet in cache.
+        unrealized_pnl, realized_pnl, daily_pnl in the database.  Also
+        fetches contract details for any new conids not yet in cache.
+
+        Uses reqPnLSingle subscriptions to get exact daily P&L from IB.
         """
         try:
             items: list[PortfolioItem] = self._ib.portfolio()
@@ -325,12 +329,44 @@ class IBBridge:
         loop = asyncio.get_event_loop()
         new_conids = False
 
+        # Build a map of conId → dailyPnL from active PnLSingle subscriptions
+        daily_pnl_map: dict[int, float | None] = {}
+        try:
+            for ps in self._ib.pnlSingle():
+                if ps.conId and ps.dailyPnL is not None and ps.dailyPnL == ps.dailyPnL:
+                    daily_pnl_map[ps.conId] = ps.dailyPnL
+        except Exception:
+            logger.debug("pnl_single_read_failed")
+
+        # Subscribe to account-level PnL and upsert DailyPnL tag
+        try:
+            for pnl_obj in self._ib.pnl():
+                if pnl_obj.dailyPnL is not None and pnl_obj.dailyPnL == pnl_obj.dailyPnL:
+                    loop.create_task(
+                        self._upsert_account_summary_safe(
+                            account=pnl_obj.account,
+                            tag="DailyPnL",
+                            value=str(pnl_obj.dailyPnL),
+                            currency="USD",
+                        )
+                    )
+        except Exception:
+            logger.debug("pnl_account_read_failed")
+
         for item in items:
             conid = item.contract.conId
             if not conid:
                 continue
 
-            # Update market values in DB
+            # Subscribe to per-position PnL if not already
+            if conid not in self._pnl_subscribed_conids:
+                try:
+                    self._ib.reqPnLSingle(item.account, "", conid)
+                    self._pnl_subscribed_conids.add(conid)
+                except Exception:
+                    logger.debug("req_pnl_single_failed", conid=conid)
+
+            # Update market values in DB (including daily P&L from IB)
             loop.create_task(
                 self._update_market_values_safe(
                     account=item.account,
@@ -339,6 +375,7 @@ class IBBridge:
                     market_value=item.marketValue,
                     unrealized_pnl=item.unrealizedPNL,
                     realized_pnl=item.realizedPNL,
+                    daily_pnl=daily_pnl_map.get(conid),
                 )
             )
 
@@ -371,7 +408,7 @@ class IBBridge:
         }
         loop.create_task(self._publish_safe(_REDIS_CHANNEL, summary))
 
-        logger.debug("portfolio_refreshed", count=len(items))
+        logger.debug("portfolio_refreshed", count=len(items), pnl_singles=len(daily_pnl_map))
 
     async def _update_market_values_safe(
         self,
@@ -381,6 +418,7 @@ class IBBridge:
         market_value: float | None,
         unrealized_pnl: float | None,
         realized_pnl: float | None,
+        daily_pnl: float | None = None,
     ) -> None:
         """Safely update market values, catching exceptions."""
         try:
@@ -391,6 +429,7 @@ class IBBridge:
                 market_value=market_value,
                 unrealized_pnl=unrealized_pnl,
                 realized_pnl=realized_pnl,
+                daily_pnl=daily_pnl,
             )
         except Exception:
             logger.exception("market_values_update_failed", conid=conid)
@@ -473,6 +512,212 @@ class IBBridge:
             logger.exception("redis_publish_failed", channel=channel)
 
     # ------------------------------------------------------------------
+    # Execution / order tracking
+    # ------------------------------------------------------------------
+
+    def _trade_to_execution_event(self, trade: Trade) -> ExecutionEvent:
+        """Convert an ib_insync Trade object to an ExecutionEvent."""
+        contract = trade.contract
+        order = trade.order
+        os = trade.orderStatus
+
+        # Use permId as exec_id (unique per order). orderId is 0 for
+        # completed orders returned by reqCompletedOrders.
+        perm = getattr(order, "permId", 0) or 0
+        exec_id = f"{perm}" if perm else f"{order.orderId}_{contract.conId}"
+
+        # Determine exec_time from the most recent fill, or use current time
+        exec_time = datetime.now(timezone.utc).isoformat()
+        if trade.fills:
+            last_fill = trade.fills[-1]
+            ft = getattr(last_fill.execution, "time", None)
+            if ft is not None:
+                exec_time = ft.isoformat() if hasattr(ft, "isoformat") else str(ft)
+
+        # Aggregate commission from all fills (guard against IB sentinel ~1.8e308)
+        total_commission: float | None = None
+        if trade.fills:
+            comms = [
+                f.commissionReport.commission
+                for f in trade.fills
+                if f.commissionReport
+                and f.commissionReport.commission is not None
+                and f.commissionReport.commission < 1e9
+            ]
+            total_commission = sum(comms) if comms else None
+
+        lmt = float(order.lmtPrice) if order.lmtPrice and order.lmtPrice < 1e9 else None
+
+        # Prefer fill data over orderStatus — completed orders from
+        # reqCompletedOrders have empty orderStatus but populated fills
+        # once reqExecutions has been called.
+        if trade.fills:
+            last_exec = trade.fills[-1].execution
+            filled = float(last_exec.cumQty) if last_exec.cumQty else 0.0
+            avg_price = float(last_exec.avgPrice) if last_exec.avgPrice else None
+        else:
+            filled = float(os.filled) if os.filled is not None and os.filled > 0 else 0.0
+            avg_price = float(os.avgFillPrice) if os.avgFillPrice is not None and os.avgFillPrice > 0 else None
+
+        # totalQuantity: prefer from order, fall back to filled qty
+        qty = float(order.totalQuantity) if order.totalQuantity is not None and float(order.totalQuantity) > 0 else filled
+
+        return ExecutionEvent(
+            exec_id=exec_id,
+            account=order.account or "",
+            conid=contract.conId if contract.conId else None,
+            symbol=contract.symbol or "",
+            sec_type=contract.secType or "",
+            currency=contract.currency or "",
+            exchange=contract.exchange or None,
+            side=order.action,
+            order_type=order.orderType,
+            quantity=qty,
+            filled_qty=filled,
+            avg_fill_price=avg_price,
+            lmt_price=lmt,
+            commission=total_commission,
+            status=os.status,
+            order_ref=order.orderRef or None,
+            exec_time=exec_time,
+        )
+
+    def _refresh_executions(self) -> None:
+        """Refresh execution data from IB fills (grouped by permId).
+
+        Uses ``ib.fills()`` which is the most reliable source of execution
+        data — it works for both active orders and completed orders returned
+        by ``reqCompletedOrders`` + ``reqExecutions``.
+        """
+        try:
+            fills = self._ib.fills()
+        except Exception:
+            logger.exception("executions_refresh_failed")
+            return
+
+        if not fills:
+            return
+
+        # Group fills by permId to produce one ExecutionEvent per order
+        from collections import defaultdict
+        by_perm: dict[int, list] = defaultdict(list)
+        for fill in fills:
+            perm = fill.execution.permId
+            if perm:
+                by_perm[perm].append(fill)
+
+        loop = asyncio.get_event_loop()
+        count = 0
+
+        for perm_id, order_fills in by_perm.items():
+            try:
+                event = self._fills_to_execution_event(perm_id, order_fills)
+                loop.create_task(self._persist_and_publish_execution(event))
+                count += 1
+            except Exception:
+                logger.exception(
+                    "execution_conversion_failed",
+                    perm_id=perm_id,
+                )
+
+        logger.debug("executions_refreshed", count=count)
+
+    def _fills_to_execution_event(self, perm_id: int, fills: list) -> ExecutionEvent:
+        """Build an ExecutionEvent from a group of fills sharing the same permId."""
+        last_fill = fills[-1]
+        contract = last_fill.contract
+        execution = last_fill.execution
+
+        # Use the last fill's cumQty/avgPrice (they are running totals)
+        filled = float(execution.cumQty) if execution.cumQty else 0.0
+        avg_price = float(execution.avgPrice) if execution.avgPrice else None
+
+        # Determine total quantity — cumQty on the last fill IS the total for
+        # fully-filled orders; for partial fills it's what's been filled so far
+        qty = filled
+
+        # Aggregate commission from all fills (guard against IB sentinel)
+        comms = [
+            f.commissionReport.commission
+            for f in fills
+            if f.commissionReport
+            and f.commissionReport.commission is not None
+            and f.commissionReport.commission < 1e9
+        ]
+        total_commission = sum(comms) if comms else None
+
+        # Exec time from last fill
+        ft = getattr(execution, "time", None)
+        exec_time = ft.isoformat() if ft and hasattr(ft, "isoformat") else datetime.now(timezone.utc).isoformat()
+
+        # Side: execution.side is "BOT" or "SLD"
+        side = "BUY" if execution.side == "BOT" else "SELL"
+
+        # Order type from the matching trade (if any), otherwise "?"
+        order_type = "?"
+        order_ref = None
+        lmt: float | None = None
+        status = "Filled"
+        for trade in self._ib.trades():
+            if getattr(trade.order, "permId", 0) == perm_id:
+                order_type = trade.order.orderType or "?"
+                order_ref = trade.order.orderRef or None
+                lp = trade.order.lmtPrice
+                lmt = float(lp) if lp and lp < 1e9 else None
+                status = trade.orderStatus.status or "Filled"
+                # Also use order's totalQuantity if available
+                tq = float(trade.order.totalQuantity) if trade.order.totalQuantity else 0.0
+                if tq > 0:
+                    qty = tq
+                break
+
+        return ExecutionEvent(
+            exec_id=f"{perm_id}",
+            account=execution.acctNumber or "",
+            conid=contract.conId if contract.conId else None,
+            symbol=contract.symbol or "",
+            sec_type=contract.secType or "",
+            currency=contract.currency or "",
+            exchange=contract.exchange or None,
+            side=side,
+            order_type=order_type,
+            quantity=qty,
+            filled_qty=filled,
+            avg_fill_price=avg_price,
+            lmt_price=lmt,
+            commission=total_commission,
+            status=status,
+            order_ref=order_ref,
+            exec_time=exec_time,
+        )
+
+    async def _persist_and_publish_execution(self, event: ExecutionEvent) -> None:
+        """Upsert execution to Postgres and publish to Redis."""
+        try:
+            await upsert_execution(event)
+        except Exception:
+            logger.exception("execution_upsert_failed", exec_id=event.exec_id)
+
+        try:
+            await self._publisher.publish(_REDIS_EXEC_CHANNEL, event.model_dump())
+        except Exception:
+            logger.exception("execution_publish_failed", exec_id=event.exec_id)
+
+    def _on_exec_details(self, trade: Trade, fill: Fill) -> None:
+        """Callback fired by ib_insync for every new execution fill."""
+        try:
+            perm_id = fill.execution.permId
+            if not perm_id:
+                return
+            # Collect all fills for this permId from the IB client
+            all_fills = [f for f in self._ib.fills() if f.execution.permId == perm_id]
+            event = self._fills_to_execution_event(perm_id, all_fills)
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._persist_and_publish_execution(event))
+        except Exception:
+            logger.exception("on_exec_details_failed")
+
+    # ------------------------------------------------------------------
     # Graceful shutdown
     # ------------------------------------------------------------------
 
@@ -512,12 +757,40 @@ class IBBridge:
         self._ib.reqAccountSummary()
         logger.info("account_summary_requested")
 
+        # Subscribe to account-level P&L for daily P&L tracking
+        try:
+            accounts = self._ib.managedAccounts()
+            for acct in accounts:
+                self._ib.reqPnL(acct)
+            logger.info("pnl_subscribed", accounts=accounts)
+        except Exception:
+            logger.exception("pnl_subscription_failed")
+
+        # Request completed orders for today and subscribe to execution events
+        try:
+            self._ib.reqCompletedOrders(apiOnly=False)
+            logger.info("completed_orders_requested")
+        except Exception:
+            logger.exception("completed_orders_request_failed")
+
+        # Request today's execution reports — this populates fills on Trade
+        # objects created by reqCompletedOrders (which only have order data).
+        try:
+            fills = self._ib.reqExecutions()
+            logger.info("executions_requested", fill_count=len(fills))
+        except Exception:
+            logger.exception("req_executions_failed")
+
+        self._ib.execDetailsEvent += self._on_exec_details
+
         # Allow initial position callbacks to fire, then fetch contract details
         self._ib.sleep(2)
         self._fetch_all_contract_details()
 
         # Re-enrich positions now that contract details are cached
         self._re_enrich_positions()
+        # Initial execution sync
+        self._refresh_executions()
         # Give tasks a moment to execute
         self._ib.sleep(1)
 
@@ -530,6 +803,7 @@ class IBBridge:
                 if now - last_refresh >= self._refresh_interval:
                     self._refresh_portfolio()
                     self._refresh_account_summary()
+                    self._refresh_executions()
                     last_refresh = now
         finally:
             self._cleanup()

@@ -59,6 +59,55 @@ def _serialize_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# Reverse alias map: ticker symbol -> set of lowercase search terms.
+# Used by _filter_ticker_relevance to check if an article actually
+# mentions a ticker (by symbol or company name).
+_TICKER_ALIASES: dict[str, set[str]] = {}
+
+
+def _build_ticker_aliases() -> dict[str, set[str]]:
+    """Build a reverse alias map from the shared rss_feeds module."""
+    if _TICKER_ALIASES:
+        return _TICKER_ALIASES
+    try:
+        from shared.data.rss_feeds import _HARDCODED_ALIASES
+        for alias, ticker in _HARDCODED_ALIASES.items():
+            _TICKER_ALIASES.setdefault(ticker, set()).add(alias.lower())
+    except ImportError:
+        pass
+    return _TICKER_ALIASES
+
+
+def _filter_ticker_relevance(
+    rows: list[dict[str, Any]], symbol: str
+) -> list[dict[str, Any]]:
+    """Filter RSS_NEWS rows to only those that actually mention *symbol*.
+
+    Articles from curated feeds (non-Google-News) pass through unchanged.
+    For Google News articles, we require the ticker symbol or a known
+    company name alias to appear in the title or snippet text.
+    """
+    aliases = _build_ticker_aliases()
+    search_terms = {symbol.lower()}
+    search_terms.update(aliases.get(symbol, set()))
+
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        source = (row.get("source_name") or "")
+        # Curated feeds: always keep
+        if not source.startswith("Google News:"):
+            filtered.append(row)
+            continue
+        # Google News: check if ticker actually mentioned
+        haystack = " ".join([
+            (row.get("title") or ""),
+            (row.get("raw_text_snippet") or ""),
+        ]).lower()
+        if any(term in haystack for term in search_terms):
+            filtered.append(row)
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # 1. GET /events – List events with filters
 # ---------------------------------------------------------------------------
@@ -725,7 +774,7 @@ async def today_events(
     scope: str = Query(default="my", regex="^(my|all)$"),
     min_severity: int = Query(default=0, ge=0, le=100),
     types: str = Query(default="RSS_NEWS,SEC_FILING"),
-    limit: int = Query(default=200, ge=1, le=500),
+    limit: int = Query(default=100, ge=1, le=500),
     cursor: Optional[str] = Query(default=None),
 ):
     """Live news tape — events from today (America/New_York timezone), newest first."""
@@ -885,6 +934,7 @@ async def events_since(
     since_ts: str = Query(description="ISO timestamp — return events newer than this"),
     scope: str = Query(default="my", regex="^(my|all)$"),
     min_severity: int = Query(default=0, ge=0, le=100),
+    types: Optional[str] = Query(default=None, description="Comma-separated event types to include"),
 ):
     """Polling fallback — returns events newer than the given timestamp."""
     try:
@@ -893,6 +943,18 @@ async def events_since(
         raise HTTPException(status_code=400, detail="Invalid since_ts format")
 
     params: dict[str, Any] = {"since_ts": since_dt, "min_sev": min_severity}
+
+    # Type filter
+    type_filter = ""
+    if types:
+        type_list = [t.strip() for t in types.split(",") if t.strip()]
+        if type_list:
+            type_placeholders = []
+            for i, t in enumerate(type_list):
+                key = f"type_{i}"
+                type_placeholders.append(f":{key}")
+                params[key] = t
+            type_filter = f"AND type IN ({', '.join(type_placeholders)})"
 
     portfolio_filter = ""
     if scope == "my":
@@ -922,7 +984,7 @@ async def events_since(
                created_at_utc, updated_at_utc
         FROM events
         WHERE ts_utc > :since_ts AND severity_score >= :min_sev
-              {portfolio_filter}
+              {type_filter} {portfolio_filter}
         ORDER BY ts_utc DESC
         LIMIT 100
     """
@@ -970,16 +1032,33 @@ async def ticker_overview(
             pos_dict["weight_pct"] = round(abs(pos_dict.get("market_value", 0)) / tmv * 100, 2)
             position_context = pos_dict
 
-        # 2. Recent events for this ticker
-        events_result = await conn.execute(text(
-            "SELECT id, ts_utc, scheduled_for_utc, type, tickers, title, "
+        # 2. Recent events for this ticker — fetch per-type so filings
+        #    don't get crowded out by high-volume RSS news.
+        _event_cols = (
+            "id, ts_utc, scheduled_for_utc, type, tickers, title, "
             "source_name, source_url, raw_text_snippet, severity_score, "
             "reason_codes, llm_summary, status, metadata_json, "
-            "created_at_utc, updated_at_utc "
-            "FROM events WHERE tickers LIKE :ticker_pattern AND ts_utc >= :cutoff "
-            "ORDER BY ts_utc DESC LIMIT 50"
-        ), {"ticker_pattern": f"%{symbol}%", "cutoff": cutoff})
-        recent_events = [_serialize_row(dict(r)) for r in events_result.mappings().all()]
+            "created_at_utc, updated_at_utc"
+        )
+        recent_events: list[dict] = []
+        for _etype, _limit in [("SEC_FILING", 20), ("RSS_NEWS", 100), ("MACRO_SCHEDULE", 10), ("OTHER", 10)]:
+            etype_result = await conn.execute(text(
+                f"SELECT {_event_cols} FROM events "
+                "WHERE tickers LIKE :ticker_pattern AND ts_utc >= :cutoff AND type = :etype "
+                "ORDER BY ts_utc DESC LIMIT :lim"
+            ), {"ticker_pattern": f"%{symbol}%", "cutoff": cutoff, "etype": _etype, "lim": _limit})
+            rows = [_serialize_row(dict(r)) for r in etype_result.mappings().all()]
+
+            # For RSS_NEWS, post-filter Google News articles to only keep
+            # those that actually mention the ticker in their text.  Google
+            # News search returns many tangentially-related articles that
+            # get force-tagged with the search ticker during ingestion.
+            if _etype == "RSS_NEWS":
+                rows = _filter_ticker_relevance(rows, symbol)[:30]
+
+            recent_events.extend(rows)
+        # Sort combined results by ts_utc descending
+        recent_events.sort(key=lambda e: e.get("ts_utc", ""), reverse=True)
 
         # 3. Upcoming scheduled events for this ticker
         upcoming_result = await conn.execute(text(
@@ -1001,7 +1080,78 @@ async def ticker_overview(
 
 
 # ---------------------------------------------------------------------------
-# Mount the alerts sub-router
+# 14. Keyword watchlist CRUD
+# ---------------------------------------------------------------------------
+
+_keywords_router = APIRouter(prefix="/keywords", tags=["keywords"])
+
+
+class KeywordCreate(BaseModel):
+    """Body for POST /events/keywords."""
+    keyword: str
+
+
+@_keywords_router.get("")
+async def list_keywords() -> list[dict[str, Any]]:
+    """Return all keyword watchlist entries."""
+    try:
+        engine = get_shared_engine()
+        async with engine.connect() as conn:
+            result = await conn.execute(text(
+                "SELECT id, keyword, enabled, created_at_utc "
+                "FROM keyword_watchlist ORDER BY keyword ASC"
+            ))
+            return [_serialize_row(dict(r)) for r in result.mappings().all()]
+    except Exception as e:
+        logger.exception("list_keywords_failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@_keywords_router.post("")
+async def add_keyword(body: KeywordCreate) -> dict[str, Any]:
+    """Add a keyword to the watchlist."""
+    kw = body.keyword.strip()
+    if not kw:
+        raise HTTPException(status_code=400, detail="Keyword cannot be empty")
+
+    try:
+        engine = get_shared_engine()
+        async with engine.begin() as conn:
+            result = await conn.execute(text(
+                "INSERT INTO keyword_watchlist (keyword) VALUES (:kw) "
+                "ON CONFLICT (keyword) DO NOTHING RETURNING id"
+            ), {"kw": kw.lower()})
+            row = result.first()
+            if row is None:
+                return {"ok": True, "message": "Keyword already exists"}
+            return {"ok": True, "id": row[0], "keyword": kw.lower()}
+    except Exception as e:
+        logger.exception("add_keyword_failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@_keywords_router.delete("/{keyword_id}")
+async def delete_keyword(keyword_id: int) -> dict[str, Any]:
+    """Remove a keyword from the watchlist."""
+    try:
+        engine = get_shared_engine()
+        async with engine.begin() as conn:
+            result = await conn.execute(text(
+                "DELETE FROM keyword_watchlist WHERE id = :id"
+            ), {"id": keyword_id})
+            if result.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Keyword not found")
+        return {"ok": True, "id": keyword_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("delete_keyword_failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Mount sub-routers
 # ---------------------------------------------------------------------------
 
 router.include_router(_alerts_router)
+router.include_router(_keywords_router)

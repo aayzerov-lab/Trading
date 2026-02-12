@@ -37,12 +37,13 @@ function timeAgo(iso: string): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-function fmtCurrency(v: number): string {
+function fmtCurrency(v: number | null | undefined): string {
+  if (v == null || isNaN(v)) return "—";
   return v.toLocaleString("en-US", { style: "currency", currency: "USD" });
 }
 
 function sevColor(s: number) {
-  return s >= 80 ? "var(--red)" : s >= 50 ? "var(--yellow)" : "var(--text-muted)";
+  return s >= 75 ? "var(--red)" : s >= 50 ? "var(--yellow)" : "var(--text-muted)";
 }
 
 function normalizeEvent(raw: Record<string, unknown>): Event {
@@ -138,37 +139,6 @@ function GroupSection({ title, events, emptyLabel, expandedId, onToggle, onStatu
   );
 }
 
-// ---- "Why It Matters" -------------------------------------------------------
-
-function WhyItMatters({ overview, days }: { overview: TickerOverview; days: number }) {
-  const bullets: string[] = [];
-  const pos = overview.position;
-  if (pos) {
-    bullets.push(`You hold ${pos.position.toLocaleString()} shares (${pos.weight_pct.toFixed(1)}% of portfolio)`);
-  }
-  const highSev = overview.events.filter((e) => e.severity_score >= 80);
-  if (highSev.length > 0) bullets.push(`${highSev.length} high-impact event${highSev.length > 1 ? "s" : ""} in the last ${days} days`);
-  if (overview.upcoming.length > 0) {
-    const next = overview.upcoming[0];
-    const daysUntil = Math.max(0, Math.ceil((new Date(next.ts_utc).getTime() - Date.now()) / 86_400_000));
-    bullets.push(`Next scheduled event: ${next.title} in ${daysUntil} day${daysUntil !== 1 ? "s" : ""}`);
-  }
-  if (pos && pos.weight_pct > 5) bullets.push("Large position -- watch for outsized impact");
-
-  if (bullets.length === 0) return null;
-  return (
-    <div style={{ background: "var(--bg-panel)", border: "1px solid var(--border-primary)", borderRadius: 2, padding: 12, marginTop: 8 }}>
-      <div style={{ fontFamily: sans, fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--text-muted)", marginBottom: 8, paddingBottom: 6, borderBottom: "1px solid var(--border-subtle)" }}>Why It Matters</div>
-      {bullets.map((b, i) => (
-        <div key={i} style={{ fontFamily: sans, fontSize: 10, color: "var(--text-secondary)", padding: "3px 0", lineHeight: 1.5, display: "flex", gap: 6 }}>
-          <span style={{ color: "var(--yellow)", fontWeight: 600 }}>*</span>
-          <span>{b}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 // ---- Main component ---------------------------------------------------------
 
 export default function TickerDesk() {
@@ -197,7 +167,7 @@ export default function TickerDesk() {
     setDetailLoading(true);
     setExpandedId(null);
     try {
-      const res = await fetch(`${API_URL}/events/ticker/${sym}/overview?days=${d}`);
+      const res = await fetch(`${API_URL}/events/ticker/${encodeURIComponent(sym)}/overview?days=${d}`);
       if (!res.ok) throw new Error("fetch failed");
       const raw = await res.json();
       const ov: TickerOverview = {
@@ -296,12 +266,12 @@ export default function TickerDesk() {
               </div>
               {pos ? (
                 <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
-                  <Stat label="Shares" value={pos.position.toLocaleString()} />
+                  <Stat label="Shares" value={pos.position != null ? pos.position.toLocaleString() : "—"} />
                   <Stat label="Avg Cost" value={fmtCurrency(pos.avg_cost)} />
                   <Stat label="Mkt Price" value={fmtCurrency(pos.market_price)} />
                   <Stat label="Mkt Value" value={fmtCurrency(pos.market_value)} />
-                  <Stat label="Unrealized P&L" value={fmtCurrency(pos.unrealized_pnl)} color={pos.unrealized_pnl >= 0 ? "var(--green)" : "var(--red)"} />
-                  <Stat label="Weight" value={`${pos.weight_pct.toFixed(2)}%`} />
+                  <Stat label="Unrealized P&L" value={fmtCurrency(pos.unrealized_pnl)} color={(pos.unrealized_pnl ?? 0) >= 0 ? "var(--green)" : "var(--red)"} />
+                  <Stat label="Weight" value={pos.weight_pct != null ? `${pos.weight_pct.toFixed(2)}%` : "—"} />
                 </div>
               ) : (
                 <span style={{ fontFamily: mono, fontSize: 10, color: "var(--text-dimmed)" }}>No current position</span>
@@ -323,8 +293,6 @@ export default function TickerDesk() {
               <GroupSection title="Scheduled" events={scheduled} emptyLabel="No scheduled events" expandedId={expandedId} onToggle={(id) => setExpandedId(expandedId === id ? null : id)} onStatus={handleStatus} />
             </div>
 
-            {/* Why It Matters */}
-            <WhyItMatters overview={overview} days={days} />
           </>
         )}
       </div>

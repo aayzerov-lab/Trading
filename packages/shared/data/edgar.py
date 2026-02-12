@@ -81,7 +81,7 @@ def _get_sec_headers() -> dict[str, str]:
     company name and administrative contact email.
     """
     return {
-        "User-Agent": "TradingWorkstation admin@localhost",
+        "User-Agent": "PersonalTradingWorkstation contact@tradingworkstation.dev",
         "Accept-Encoding": "gzip, deflate",
         "Accept": "application/json",
     }

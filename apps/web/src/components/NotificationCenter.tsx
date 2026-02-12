@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Alert, AlertStatus, fetchAlerts, fetchUnreadAlertCount, updateAlertStatus,
+  Alert, AlertStatus, Keyword, fetchAlerts, fetchUnreadAlertCount, updateAlertStatus,
+  fetchKeywords, addKeyword, deleteKeyword,
 } from "@/lib/events-api";
 
 function timeAgo(iso: string): string {
@@ -35,7 +36,7 @@ const S: Record<string, React.CSSProperties> = {
   },
   panel: {
     position: "absolute", top: "calc(100% + 6px)", right: 0, width: 360,
-    maxHeight: 400, overflowY: "auto", background: "var(--bg-panel)",
+    maxHeight: 480, overflowY: "auto", background: "var(--bg-panel)",
     border: "1px solid var(--border-primary)", borderRadius: 2,
     boxShadow: "0 8px 24px rgba(0,0,0,0.5)", zIndex: 1000, fontFamily: "var(--font-mono)",
   },
@@ -65,13 +66,53 @@ const S: Record<string, React.CSSProperties> = {
     background: "none", border: "none", color: "var(--text-muted)",
     fontSize: 10, cursor: "pointer", fontFamily: "var(--font-mono)", padding: "2px 0",
   },
+  tabs: {
+    display: "flex", borderBottom: "1px solid var(--border-subtle)",
+  },
+  tab: {
+    flex: 1, padding: "6px 0", textAlign: "center", fontSize: 10,
+    fontFamily: "var(--font-mono)", fontWeight: 600, cursor: "pointer",
+    background: "none", border: "none", color: "var(--text-muted)",
+    textTransform: "uppercase", letterSpacing: "0.5px",
+  },
+  tabActive: {
+    color: "var(--accent)", borderBottom: "2px solid var(--accent)",
+  },
+  kwSection: { padding: "8px 12px" },
+  kwRow: {
+    display: "flex", alignItems: "center", justifyContent: "space-between",
+    padding: "4px 0", borderBottom: "1px solid var(--border-subtle)",
+  },
+  kwText: { fontSize: 11, color: "var(--text-primary)" },
+  kwDelete: {
+    background: "none", border: "none", color: "var(--text-muted)",
+    fontSize: 10, cursor: "pointer", fontFamily: "var(--font-mono)", padding: "2px 4px",
+  },
+  kwInput: {
+    display: "flex", gap: 6, marginTop: 8,
+  },
+  kwField: {
+    flex: 1, background: "var(--bg-input)", border: "1px solid var(--border-subtle)",
+    borderRadius: 2, padding: "4px 8px", fontSize: 11, color: "var(--text-primary)",
+    fontFamily: "var(--font-mono)", outline: "none",
+  },
+  kwAdd: {
+    background: "var(--accent)", border: "none", color: "#000",
+    borderRadius: 2, padding: "4px 10px", fontSize: 10, cursor: "pointer",
+    fontFamily: "var(--font-mono)", fontWeight: 600,
+  },
 };
+
+type Tab = "alerts" | "keywords";
 
 export default function NotificationCenter() {
   const [unreadCount, setUnreadCount] = useState(0);
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [keywords, setKeywords] = useState<Keyword[]>([]);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [tab, setTab] = useState<Tab>("alerts");
+  const [newKw, setNewKw] = useState("");
   const containerRef = useRef<HTMLDivElement>(null);
 
   const refreshUnreadCount = useCallback(async () => {
@@ -87,6 +128,10 @@ export default function NotificationCenter() {
     } catch { /* degrade */ } finally { setLoading(false); }
   }, []);
 
+  const loadKeywords = useCallback(async () => {
+    try { setKeywords(await fetchKeywords()); } catch { /* degrade */ }
+  }, []);
+
   // Poll unread count every 30s
   useEffect(() => {
     refreshUnreadCount();
@@ -94,8 +139,13 @@ export default function NotificationCenter() {
     return () => clearInterval(id);
   }, [refreshUnreadCount]);
 
-  // Load alerts when dropdown opens
-  useEffect(() => { if (open) loadAlerts(); }, [open, loadAlerts]);
+  // Load data when dropdown opens
+  useEffect(() => {
+    if (open) {
+      loadAlerts();
+      loadKeywords();
+    }
+  }, [open, loadAlerts, loadKeywords]);
 
   // Close on outside click
   useEffect(() => {
@@ -125,6 +175,23 @@ export default function NotificationCenter() {
     } catch { /* degrade */ }
   }, [alerts, refreshUnreadCount]);
 
+  const handleAddKeyword = useCallback(async () => {
+    const kw = newKw.trim();
+    if (!kw) return;
+    try {
+      await addKeyword(kw);
+      setNewKw("");
+      await loadKeywords();
+    } catch { /* degrade */ }
+  }, [newKw, loadKeywords]);
+
+  const handleDeleteKeyword = useCallback(async (id: number) => {
+    try {
+      await deleteKeyword(id);
+      setKeywords((prev) => prev.filter((k) => k.id !== id));
+    } catch { /* degrade */ }
+  }, []);
+
   return (
     <div ref={containerRef} style={S.wrap}>
       {/* Bell button */}
@@ -146,42 +213,99 @@ export default function NotificationCenter() {
       {/* Dropdown */}
       {open && (
         <div style={S.panel}>
-          <div style={S.panelHeader}>
-            <span style={S.title as React.CSSProperties}>Notifications</span>
-            <button onClick={handleMarkAllRead} style={S.markAll}>Mark all read</button>
+          {/* Tabs */}
+          <div style={S.tabs as React.CSSProperties}>
+            <button
+              style={{ ...S.tab, ...(tab === "alerts" ? S.tabActive : {}) } as React.CSSProperties}
+              onClick={() => setTab("alerts")}
+            >
+              Alerts
+            </button>
+            <button
+              style={{ ...S.tab, ...(tab === "keywords" ? S.tabActive : {}) } as React.CSSProperties}
+              onClick={() => setTab("keywords")}
+            >
+              Keywords
+            </button>
           </div>
 
-          {loading && alerts.length === 0 && <div style={S.empty}>Loading...</div>}
-          {!loading && alerts.length === 0 && <div style={S.empty}>No notifications</div>}
-
-          {alerts.map((a) => (
-            <div key={a.id} style={{
-              ...S.row,
-              background: a.status === "NEW" ? "var(--bg-panel-alt)" : "transparent",
-            }}>
-              <div style={S.rowInner as React.CSSProperties}>
-                <span style={{ ...S.dot, background: severityColor(a.severity) }} />
-                <div style={S.body as React.CSSProperties}>
-                  <div style={S.msg as React.CSSProperties}>{a.message}</div>
-                  <div style={S.time}>{timeAgo(a.ts_utc)}</div>
-                </div>
+          {/* Alerts tab */}
+          {tab === "alerts" && (
+            <>
+              <div style={S.panelHeader}>
+                <span style={S.title as React.CSSProperties}>Notifications</span>
+                <button onClick={handleMarkAllRead} style={S.markAll}>Mark all read</button>
               </div>
-              <div style={S.actions as React.CSSProperties}>
-                {a.status === "NEW" && (
-                  <button onClick={() => handleAction(a.id, "READ")} style={S.actionBtn}>
-                    Read
+
+              {loading && alerts.length === 0 && <div style={S.empty}>Loading...</div>}
+              {!loading && alerts.length === 0 && <div style={S.empty}>No notifications</div>}
+
+              {alerts.map((a) => (
+                <div key={a.id} style={{
+                  ...S.row,
+                  background: a.status === "NEW" ? "var(--bg-panel-alt)" : "transparent",
+                }}>
+                  <div style={S.rowInner as React.CSSProperties}>
+                    <span style={{ ...S.dot, background: severityColor(a.severity) }} />
+                    <div style={S.body as React.CSSProperties}>
+                      <div style={S.msg as React.CSSProperties}>{a.message}</div>
+                      <div style={S.time}>{timeAgo(a.ts_utc)}</div>
+                    </div>
+                  </div>
+                  <div style={S.actions as React.CSSProperties}>
+                    {a.status === "NEW" && (
+                      <button onClick={() => handleAction(a.id, "READ")} style={S.actionBtn}>
+                        Read
+                      </button>
+                    )}
+                    <button onClick={() => handleAction(a.id, "SNOOZED", 4)} style={S.actionBtn}>
+                      Snooze 4h
+                    </button>
+                    <button onClick={() => handleAction(a.id, "DISMISSED")}
+                      style={{ ...S.actionBtn, color: "var(--red)" }}>
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+
+          {/* Keywords tab */}
+          {tab === "keywords" && (
+            <div style={S.kwSection}>
+              <div style={{ fontSize: 10, color: "var(--text-dimmed)", marginBottom: 8 }}>
+                Add keywords to get notified when they appear in news headlines.
+              </div>
+
+              {keywords.length === 0 && (
+                <div style={S.empty}>No keywords set. Add one below.</div>
+              )}
+
+              {keywords.map((k) => (
+                <div key={k.id} style={S.kwRow}>
+                  <span style={S.kwText}>{k.keyword}</span>
+                  <button
+                    onClick={() => handleDeleteKeyword(k.id)}
+                    style={{ ...S.kwDelete, color: "var(--red)" }}
+                  >
+                    x
                   </button>
-                )}
-                <button onClick={() => handleAction(a.id, "SNOOZED", 4)} style={S.actionBtn}>
-                  Snooze 4h
-                </button>
-                <button onClick={() => handleAction(a.id, "DISMISSED")}
-                  style={{ ...S.actionBtn, color: "var(--red)" }}>
-                  Dismiss
-                </button>
+                </div>
+              ))}
+
+              <div style={S.kwInput as React.CSSProperties}>
+                <input
+                  style={S.kwField}
+                  placeholder="e.g. tariff, layoff, FDA..."
+                  value={newKw}
+                  onChange={(e) => setNewKw(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleAddKeyword(); }}
+                />
+                <button onClick={handleAddKeyword} style={S.kwAdd}>Add</button>
               </div>
             </div>
-          ))}
+          )}
         </div>
       )}
     </div>

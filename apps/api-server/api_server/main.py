@@ -18,9 +18,17 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from api_server.config import get_settings
-from api_server.db import close_engine, get_account_summary, get_engine, get_positions
+from api_server.db import (
+    close_engine,
+    get_account_summary,
+    get_accounts,
+    get_daily_pnl,
+    get_engine,
+    get_executions,
+    get_positions,
+)
 from api_server.exposures import compute_exposures
-from api_server.routers import events, macro, risk
+from api_server.routers import ai, events, macro, risk
 
 logger = structlog.get_logger()
 
@@ -35,6 +43,9 @@ _redis: aioredis.Redis | None = None
 # ---------------------------------------------------------------------------
 
 _scheduler_task: asyncio.Task | None = None
+_event_sync_task: asyncio.Task | None = None
+_ticker_news_task: asyncio.Task | None = None
+_curated_rss_task: asyncio.Task | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +56,131 @@ _scheduler_task: asyncio.Task | None = None
 def get_redis() -> aioredis.Redis | None:
     """Return the module-level Redis connection."""
     return _redis
+
+
+_EVENT_SYNC_INTERVAL_HOURS = 2
+
+
+async def _run_event_sync_loop() -> None:
+    """Background task to periodically sync events (EDGAR, RSS, schedules).
+
+    Runs every 2 hours during market hours (6 AM – 8 PM ET) so the live
+    news tape stays populated throughout the trading day.
+    """
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    from shared.data.scheduler import run_event_sync
+    from shared.db.engine import get_shared_engine
+
+    ET = ZoneInfo("America/New_York")
+    logger.info("event_sync_loop_started", interval_hours=_EVENT_SYNC_INTERVAL_HOURS)
+
+    # Wait 60s on startup before the first run to let the rest of the app initialise
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            now_et = datetime.now(ET)
+            # Only sync during extended market window (6 AM – 8 PM ET)
+            if 6 <= now_et.hour < 20:
+                logger.info("event_sync_loop_triggering")
+                engine = get_shared_engine()
+                await run_event_sync(engine=engine)
+                logger.info("event_sync_loop_completed")
+            else:
+                logger.debug("event_sync_loop_skipped_outside_hours", hour_et=now_et.hour)
+
+            # Sleep until next interval
+            await asyncio.sleep(_EVENT_SYNC_INTERVAL_HOURS * 3600)
+
+        except asyncio.CancelledError:
+            logger.info("event_sync_loop_cancelled")
+            raise
+        except Exception:
+            logger.exception("event_sync_loop_error")
+            # Wait 30 minutes before retrying on error
+            await asyncio.sleep(1800)
+
+
+_TICKER_NEWS_INTERVAL_SECONDS = 60
+
+
+async def _run_ticker_news_loop() -> None:
+    """Background task to poll per-ticker Google News RSS every 60 seconds.
+
+    Only runs during market hours (6 AM - 8 PM ET).  After each sync it
+    prunes the events table to keep only the 100 most recent RSS_NEWS rows.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from shared.data.rss_feeds import sync_ticker_news_feeds
+    from shared.db.engine import get_shared_engine
+
+    ET = ZoneInfo("America/New_York")
+    logger.info("ticker_news_loop_started", interval_s=_TICKER_NEWS_INTERVAL_SECONDS)
+
+    # Wait 90s on startup to let other init complete
+    await asyncio.sleep(90)
+
+    while True:
+        try:
+            now_et = datetime.now(ET)
+            if 6 <= now_et.hour < 20:
+                engine = get_shared_engine()
+                await sync_ticker_news_feeds(engine=engine)
+            else:
+                logger.debug("ticker_news_loop_skipped_outside_hours", hour_et=now_et.hour)
+
+            await asyncio.sleep(_TICKER_NEWS_INTERVAL_SECONDS)
+
+        except asyncio.CancelledError:
+            logger.info("ticker_news_loop_cancelled")
+            raise
+        except Exception:
+            logger.exception("ticker_news_loop_error")
+            await asyncio.sleep(30)
+
+
+_CURATED_RSS_INTERVAL_SECONDS = 180  # 3 minutes
+
+
+async def _run_curated_rss_loop() -> None:
+    """Background task to sync curated RSS feeds every 3 minutes.
+
+    Covers MarketWatch, Bloomberg, CNBC, FT, Investing.com, NYT, Fed Reserve,
+    and SEC Press feeds.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from shared.data.rss_feeds import sync_rss_feeds
+    from shared.db.engine import get_shared_engine
+
+    ET = ZoneInfo("America/New_York")
+    logger.info("curated_rss_loop_started", interval_s=_CURATED_RSS_INTERVAL_SECONDS)
+
+    # Brief startup delay to let DB init complete
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            now_et = datetime.now(ET)
+            if 6 <= now_et.hour < 20:
+                engine = get_shared_engine()
+                await sync_rss_feeds(engine=engine)
+            else:
+                logger.debug("curated_rss_loop_skipped_outside_hours", hour_et=now_et.hour)
+
+            await asyncio.sleep(_CURATED_RSS_INTERVAL_SECONDS)
+
+        except asyncio.CancelledError:
+            logger.info("curated_rss_loop_cancelled")
+            raise
+        except Exception:
+            logger.exception("curated_rss_loop_error")
+            await asyncio.sleep(60)
 
 
 async def _run_scheduler() -> None:
@@ -136,7 +272,7 @@ async def _run_scheduler() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage startup / shutdown resources."""
-    global _redis, _scheduler_task
+    global _redis, _scheduler_task, _event_sync_task, _ticker_news_task, _curated_rss_task
     settings = get_settings()
 
     # Startup ---------------------------------------------------------------
@@ -160,9 +296,45 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _scheduler_task = asyncio.create_task(_run_scheduler())
     logger.info("scheduler_started")
 
+    # Start periodic event sync (every 2 hours during market hours)
+    _event_sync_task = asyncio.create_task(_run_event_sync_loop())
+    logger.info("event_sync_loop_started")
+
+    # Start fast ticker news poll (every 60 seconds)
+    _ticker_news_task = asyncio.create_task(_run_ticker_news_loop())
+    logger.info("ticker_news_loop_started")
+
+    # Start curated RSS poll (every 15 minutes)
+    _curated_rss_task = asyncio.create_task(_run_curated_rss_loop())
+    logger.info("curated_rss_loop_started")
+
     yield
 
     # Shutdown --------------------------------------------------------------
+    if _curated_rss_task is not None:
+        _curated_rss_task.cancel()
+        try:
+            await _curated_rss_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("curated_rss_loop_stopped")
+
+    if _ticker_news_task is not None:
+        _ticker_news_task.cancel()
+        try:
+            await _ticker_news_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("ticker_news_loop_stopped")
+
+    if _event_sync_task is not None:
+        _event_sync_task.cancel()
+        try:
+            await _event_sync_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("event_sync_loop_stopped")
+
     if _scheduler_task is not None:
         _scheduler_task.cancel()
         try:
@@ -205,6 +377,7 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(ai.router)
 app.include_router(risk.router)
 app.include_router(macro.router)
 app.include_router(events.router)
@@ -222,10 +395,13 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/portfolio")
-async def portfolio() -> list[dict]:
-    """Return all current positions."""
+async def portfolio(account: str | None = None) -> list[dict]:
+    """Return current positions with daily P&L.
+
+    If *account* is provided, only return positions for that account.
+    """
     try:
-        positions = await get_positions()
+        positions = await get_positions(account=account)
         # Serialise datetime objects to ISO strings for JSON
         for pos in positions:
             for key, value in pos.items():
@@ -238,10 +414,13 @@ async def portfolio() -> list[dict]:
 
 
 @app.get("/portfolio/exposures")
-async def portfolio_exposures(method: str = "market_value") -> dict:
-    """Return sector and country exposure weights."""
+async def portfolio_exposures(method: str = "market_value", account: str | None = None) -> dict:
+    """Return sector and country exposure weights.
+
+    If *account* is provided, compute exposures for that account only.
+    """
     try:
-        positions = await get_positions()
+        positions = await get_positions(account=account)
         if method not in ("market_value", "cost_basis"):
             method = "market_value"
         return compute_exposures(positions, method=method)
@@ -251,10 +430,13 @@ async def portfolio_exposures(method: str = "market_value") -> dict:
 
 
 @app.get("/account/summary")
-async def account_summary() -> list[dict]:
-    """Return account summary tags and values."""
+async def account_summary(account: str | None = None) -> list[dict]:
+    """Return account summary tags and values.
+
+    If *account* is provided, only return that account's summary rows.
+    """
     try:
-        rows = await get_account_summary()
+        rows = await get_account_summary(account=account)
         # Serialise datetime objects to ISO strings for JSON
         for row in rows:
             for key, value in row.items():
@@ -263,6 +445,37 @@ async def account_summary() -> list[dict]:
         return rows
     except Exception:
         logger.exception("account_summary_fetch_failed")
+        raise
+
+
+@app.get("/account/daily-pnl")
+async def daily_pnl(account: str | None = None) -> dict:
+    """Return daily P&L change for net liquidation value.
+
+    If *account* is provided, return the P&L for that account.
+    """
+    try:
+        return await get_daily_pnl(account=account)
+    except Exception:
+        logger.exception("daily_pnl_fetch_failed")
+        raise
+
+
+@app.get("/executions")
+async def executions_today(account: str | None = None) -> list[dict]:
+    """Return today's executions (orders and fills).
+
+    If *account* is provided, only return executions for that account.
+    """
+    try:
+        rows = await get_executions(account=account)
+        for row in rows:
+            for key, value in row.items():
+                if hasattr(value, "isoformat"):
+                    row[key] = value.isoformat()
+        return rows
+    except Exception:
+        logger.exception("executions_fetch_failed")
         raise
 
 
@@ -276,6 +489,7 @@ _CHANNEL_TYPE_MAP: dict[str, str] = {
     "data_updated": "data_updated",
     "risk_recompute": "risk_recompute",
     "risk_updated": "risk_updated",
+    "executions": "executions",
 }
 
 
@@ -299,6 +513,12 @@ async def stream(websocket: WebSocket) -> None:
         logger.error("websocket_no_redis")
         await websocket.close(code=1011, reason="Redis not available")
         return
+
+    account_filter = websocket.query_params.get("account")
+    if account_filter is not None:
+        account_filter = account_filter.strip()
+        if account_filter == "":
+            account_filter = None
 
     # Each WebSocket connection gets its own pubsub instance so that
     # unsubscribing on disconnect does not affect other connections.
@@ -327,6 +547,32 @@ async def stream(websocket: WebSocket) -> None:
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("pubsub_invalid_json", data=data, channel=channel)
                         continue
+
+                    if account_filter is not None:
+                        filtered_payload = None
+                        if isinstance(parsed, dict) and "account" in parsed:
+                            if parsed.get("account") == account_filter:
+                                filtered_payload = parsed
+                        elif (
+                            isinstance(parsed, dict)
+                            and "values" in parsed
+                            and isinstance(parsed["values"], list)
+                        ):
+                            filtered_values = [
+                                item
+                                for item in parsed["values"]
+                                if isinstance(item, dict) and item.get("account") == account_filter
+                            ]
+                            if filtered_values:
+                                filtered_payload = {**parsed, "values": filtered_values}
+                        else:
+                            # Non-account scoped messages (e.g., data_updated)
+                            filtered_payload = parsed
+
+                        if filtered_payload is None:
+                            continue
+                        parsed = filtered_payload
+
                     await websocket.send_json({"type": msg_type, "data": parsed})
             except asyncio.CancelledError:
                 # Normal shutdown path
@@ -355,3 +601,11 @@ async def stream(websocket: WebSocket) -> None:
         await pubsub.unsubscribe(*channels)
         await pubsub.aclose()
         logger.info("pubsub_cleaned_up", client=str(websocket.client))
+@app.get("/accounts")
+async def accounts() -> list[str]:
+    """Return distinct account identifiers available in the database."""
+    try:
+        return await get_accounts()
+    except Exception:
+        logger.exception("accounts_fetch_failed")
+        raise

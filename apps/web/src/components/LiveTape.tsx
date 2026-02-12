@@ -68,7 +68,7 @@ function fmtET(iso: string): string {
 }
 
 function sevColor(s: number) {
-  return s >= 80 ? "var(--red)" : s >= 50 ? "var(--yellow)" : "var(--text-dimmed)";
+  return s >= 75 ? "var(--red)" : s >= 50 ? "var(--yellow)" : "var(--text-dimmed)";
 }
 
 // ---------------------------------------------------------------------------
@@ -76,8 +76,8 @@ function sevColor(s: number) {
 // ---------------------------------------------------------------------------
 
 function SevDot({ score }: { score: number }) {
-  const bg = score >= 80 ? "var(--red)" : score >= 50 ? "var(--yellow)" : "var(--text-dimmed)";
-  const shadow = score >= 80 ? "0 0 4px var(--red)" : "none";
+  const bg = score >= 75 ? "var(--red)" : score >= 50 ? "var(--yellow)" : "var(--text-dimmed)";
+  const shadow = score >= 75 ? "0 0 4px var(--red)" : "none";
   return <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: bg, boxShadow: shadow, flexShrink: 0 }} />;
 }
 
@@ -226,7 +226,8 @@ export default function LiveTape() {
 
   // -- fetch today's events ------------------------------------------------
   const fetchToday = useCallback(async () => {
-    const minSev = highOnly ? 60 : 0;
+    setLoading(true);
+    const minSev = highOnly ? 75 : 0;
     const url = `${API_URL}/events/today?scope=${scope}&min_severity=${minSev}&types=RSS_NEWS,SEC_FILING&limit=${MAX_ITEMS}`;
     try {
       const res = await fetch(url);
@@ -243,8 +244,8 @@ export default function LiveTape() {
   // -- poll for new events -------------------------------------------------
   const poll = useCallback(async () => {
     if (!latestTs.current) return;
-    const minSev = highOnly ? 60 : 0;
-    const url = `${API_URL}/events/since?since_ts=${encodeURIComponent(latestTs.current)}&scope=${scope}&min_severity=${minSev}`;
+    const minSev = highOnly ? 75 : 0;
+    const url = `${API_URL}/events/since?since_ts=${encodeURIComponent(latestTs.current)}&scope=${scope}&min_severity=${minSev}&types=RSS_NEWS,SEC_FILING`;
     try {
       const res = await fetch(url);
       if (!res.ok) return;
@@ -320,8 +321,14 @@ export default function LiveTape() {
         )}
 
         {/* List */}
-        <div ref={listRef} style={{ flex: 1, overflowY: "auto" }}>
-          {filtered.length === 0 && <div className="empty-state" style={{ padding: 24 }}>No events</div>}
+        <div ref={listRef} style={{ flex: 1, overflowY: "auto", position: "relative" }}>
+          {loading && (
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
+              background: "rgba(var(--bg-panel-rgb, 15,17,22), 0.7)", zIndex: 2 }}>
+              <span style={{ fontFamily: mono, fontSize: 9, color: "var(--text-muted)" }}>Loading...</span>
+            </div>
+          )}
+          {filtered.length === 0 && !loading && <div className="empty-state" style={{ padding: 24 }}>No events</div>}
           {filtered.map((evt) => (
             <FeedRow key={evt.id} evt={evt} selected={selId === evt.id} onSelect={() => setSelId(evt.id)} />
           ))}

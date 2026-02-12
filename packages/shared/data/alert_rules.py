@@ -6,7 +6,7 @@ to avoid spamming the user with repeated notifications.
 
 Rules
 -----
-1. HIGH_PRIORITY_EVENT  -- events with severity >= 80
+1. KEYWORD_MATCH        -- events whose title/snippet matches a user keyword
 2. MACRO_UPCOMING       -- macro schedule events within the next 24 hours
 3. VAR_SPIKE            -- portfolio 1d 95% VaR exceeds threshold
 4. CONCENTRATION_WARNING -- single position > weight threshold
@@ -77,57 +77,75 @@ async def _table_exists(conn, table_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Rule 1: High-priority event alerts
+# Rule 1: Keyword match alerts
 # ---------------------------------------------------------------------------
 
 
-async def _check_high_priority_events(engine: AsyncEngine) -> list[dict]:
-    """Create alerts for NEW events with severity_score >= 80.
+async def _check_keyword_matches(engine: AsyncEngine) -> list[dict]:
+    """Create alerts for events whose title or snippet matches a user keyword.
 
-    Deduplication: skip events that already have a matching alert row
+    Reads enabled keywords from the ``keyword_watchlist`` table and scans
+    recent NEW events for case-insensitive substring matches.
+
+    Deduplication: skip events that already have a matching KEYWORD_MATCH alert
     (``related_event_id``).
     """
     alerts: list[dict] = []
 
     try:
         async with engine.connect() as conn:
-            if not await _table_exists(conn, "events"):
-                logger.debug("alert_rules_skip_high_priority", reason="events table missing")
+            for tbl in ("events", "alerts", "keyword_watchlist"):
+                if not await _table_exists(conn, tbl):
+                    logger.debug("alert_rules_skip_keyword", reason=f"{tbl} table missing")
+                    return alerts
+
+            # Fetch enabled keywords
+            kw_result = await conn.execute(
+                text("SELECT keyword FROM keyword_watchlist WHERE enabled = 1")
+            )
+            keywords = [str(r[0]).strip().lower() for r in kw_result if r[0]]
+
+            if not keywords:
                 return alerts
 
-            if not await _table_exists(conn, "alerts"):
-                logger.debug("alert_rules_skip_high_priority", reason="alerts table missing")
-                return alerts
-
+            # Fetch recent NEW events (last 24 hours)
+            cutoff = _utcnow() - timedelta(hours=24)
             stmt = text("""
-                SELECT e.id, e.title, e.severity_score
+                SELECT e.id, e.title, e.raw_text_snippet, e.severity_score
                 FROM events e
-                WHERE e.severity_score >= 80
-                  AND e.status = 'NEW'
+                WHERE e.status = 'NEW'
+                  AND e.ts_utc >= :cutoff
                   AND NOT EXISTS (
                       SELECT 1 FROM alerts a
                       WHERE a.related_event_id = e.id
-                        AND a.type = 'HIGH_PRIORITY_EVENT'
+                        AND a.type = 'KEYWORD_MATCH'
                   )
-                ORDER BY e.severity_score DESC
+                ORDER BY e.ts_utc DESC
             """)
-            result = await conn.execute(stmt)
+            result = await conn.execute(stmt, {"cutoff": cutoff})
             rows = result.mappings().all()
 
             for row in rows:
-                title = str(row["title"] or "Unknown event")
-                severity = int(row["severity_score"] or 80)
-                alerts.append(
-                    _make_alert(
-                        alert_type="HIGH_PRIORITY_EVENT",
-                        message=f"High-priority: {title}",
-                        severity=severity,
-                        related_event_id=str(row["id"]),
+                title = str(row["title"] or "").lower()
+                snippet = str(row["raw_text_snippet"] or "").lower()
+                search_text = f"{title} {snippet}"
+
+                matched = [kw for kw in keywords if kw in search_text]
+                if matched:
+                    display_title = str(row["title"] or "Unknown event")
+                    kw_display = ", ".join(matched[:3])
+                    severity = max(int(row["severity_score"] or 50), 70)
+                    alerts.append(
+                        _make_alert(
+                            alert_type="KEYWORD_MATCH",
+                            message=f"Keyword [{kw_display}]: {display_title}",
+                            severity=severity,
+                            related_event_id=str(row["id"]),
+                        )
                     )
-                )
 
     except Exception:
-        logger.error("alert_rules_high_priority_error", exc_info=True)
+        logger.error("alert_rules_keyword_match_error", exc_info=True)
 
     return alerts
 
@@ -525,20 +543,20 @@ async def run_alert_rules(
     by_type: dict[str, int] = {}
     rules_evaluated = 0
 
-    # --- Rule 1: High-priority events ---
+    # --- Rule 1: Keyword match alerts ---
     try:
         rules_evaluated += 1
-        high_priority = await _check_high_priority_events(engine)
-        all_alerts.extend(high_priority)
-        if high_priority:
-            by_type["HIGH_PRIORITY_EVENT"] = len(high_priority)
+        keyword_matches = await _check_keyword_matches(engine)
+        all_alerts.extend(keyword_matches)
+        if keyword_matches:
+            by_type["KEYWORD_MATCH"] = len(keyword_matches)
         logger.debug(
             "alert_rule_evaluated",
-            rule="HIGH_PRIORITY_EVENT",
-            new_alerts=len(high_priority),
+            rule="KEYWORD_MATCH",
+            new_alerts=len(keyword_matches),
         )
     except Exception:
-        logger.error("alert_rule_failed", rule="HIGH_PRIORITY_EVENT", exc_info=True)
+        logger.error("alert_rule_failed", rule="KEYWORD_MATCH", exc_info=True)
 
     # --- Rule 2: Upcoming macro releases ---
     try:

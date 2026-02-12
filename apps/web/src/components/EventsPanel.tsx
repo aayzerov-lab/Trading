@@ -11,7 +11,7 @@ interface EventsPanelProps { loading?: boolean; }
 const TYPE_LABELS: Record<EventType, string> = { SEC_FILING: "SEC", MACRO_SCHEDULE: "Macro", RSS_NEWS: "RSS", OTHER: "Other" };
 const TYPE_COLORS: Record<EventType, string> = { SEC_FILING: "#8b5cf6", MACRO_SCHEDULE: "#3b82f6", RSS_NEWS: "#10b981", OTHER: "#64748b" };
 
-function sevColor(s: number) { return s >= 80 ? "var(--red)" : s >= 50 ? "var(--yellow)" : "var(--text-muted)"; }
+function sevColor(s: number) { return s >= 75 ? "var(--red)" : s >= 50 ? "var(--yellow)" : "var(--text-muted)"; }
 
 function timeAgo(iso: string): string {
   const m = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);

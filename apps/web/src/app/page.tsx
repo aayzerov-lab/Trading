@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { Fragment, useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
   PieChart,
   Pie,
@@ -13,9 +13,14 @@ import {
   Position,
   ExposureResponse,
   AccountSummaryItem,
+  DailyPnl,
+  Execution,
   fetchPortfolio,
   fetchExposures,
   fetchAccountSummary,
+  fetchDailyPnl,
+  fetchExecutions,
+  fetchAccounts,
   WS_URL,
 } from "@/lib/api";
 import {
@@ -50,6 +55,7 @@ import TickerDesk from "@/components/TickerDesk";
 import NotificationCenter from "@/components/NotificationCenter";
 import DataQualityPanel from "@/components/DataQualityPanel";
 import RiskMetadataPanel from "@/components/RiskMetadataPanel";
+import AISearch from "@/components/AISearch";
 
 // ---------------------------------------------------------------------------
 // Stable color maps – keyed by name so colors never shift between methods
@@ -160,7 +166,7 @@ function fmtPnl(v: number | null | undefined): string {
   } else {
     formatted = abs.toFixed(0);
   }
-  return v >= 0 ? `+${formatted}` : `-${formatted}`;
+  return v === 0 ? formatted : v > 0 ? `+${formatted}` : `-${formatted}`;
 }
 
 function fmtPct(v: number | null | undefined): string {
@@ -192,7 +198,7 @@ function fmtTimestampET(iso: string | null): string {
 type WsStatus = "connected" | "disconnected" | "reconnecting";
 type WeightingMethod = "market_value" | "cost_basis";
 type SortDir = "asc" | "desc";
-type TabName = "overview" | "risk" | "stress" | "macro" | "live" | "calendar" | "ticker";
+type TabName = "overview" | "risk" | "stress" | "macro" | "live" | "calendar" | "ticker" | "ai";
 
 interface ColumnDef {
   key: string;
@@ -209,11 +215,23 @@ const COLUMNS: ColumnDef[] = [
   { key: "market_price", label: "Mkt Price", align: "right", defaultWidth: 90, sortable: true },
   { key: "pct_change", label: "% Chg", align: "right", defaultWidth: 75, sortable: true },
   { key: "market_value", label: "Mkt Value", align: "right", defaultWidth: 100, sortable: true },
+  { key: "daily_pnl", label: "Daily P&L", align: "right", defaultWidth: 95, sortable: true },
   { key: "unrealized_pnl", label: "Unrlzd P&L", align: "right", defaultWidth: 95, sortable: true },
   { key: "realized_pnl", label: "Rlzd P&L", align: "right", defaultWidth: 85, sortable: true },
   { key: "weight", label: "Wt %", align: "right", defaultWidth: 60, sortable: true },
   { key: "sector", label: "Sector", align: "left", defaultWidth: 140, sortable: true },
   { key: "country", label: "Country", align: "left", defaultWidth: 70, sortable: true },
+];
+
+const ORDER_COLUMNS: ColumnDef[] = [
+  { key: "exec_time", label: "Time", align: "left", defaultWidth: 90, sortable: false },
+  { key: "symbol", label: "Symbol", align: "left", defaultWidth: 90, sortable: false },
+  { key: "side", label: "Side", align: "left", defaultWidth: 60, sortable: false },
+  { key: "order_type", label: "Type", align: "left", defaultWidth: 60, sortable: false },
+  { key: "quantity", label: "Qty", align: "right", defaultWidth: 70, sortable: false },
+  { key: "avg_fill_price", label: "Fill Price", align: "right", defaultWidth: 90, sortable: false },
+  { key: "commission", label: "Comm", align: "right", defaultWidth: 70, sortable: false },
+  { key: "status", label: "Status", align: "left", defaultWidth: 80, sortable: false },
 ];
 
 // ---------------------------------------------------------------------------
@@ -260,6 +278,8 @@ function PieTooltipContent({ active, payload }: PieTooltipProps) {
 // Main dashboard component
 // ---------------------------------------------------------------------------
 
+const ACCOUNT_STORAGE_KEY = "trading.selectedAccount";
+
 export default function DashboardPage() {
   // Tab navigation
   const [activeTab, setActiveTab] = useState<TabName>("overview");
@@ -268,11 +288,20 @@ export default function DashboardPage() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [exposures, setExposures] = useState<ExposureResponse | null>(null);
   const [accountSummary, setAccountSummary] = useState<AccountSummaryItem[]>([]);
+  const [dailyPnl, setDailyPnl] = useState<DailyPnl | null>(null);
   const [weightingMethod, setWeightingMethod] = useState<WeightingMethod>("market_value");
   const [wsStatus, setWsStatus] = useState<WsStatus>("disconnected");
   const [lastUpdate, setLastUpdate] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [accounts, setAccounts] = useState<string[]>([]);
+  const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
+  const [accountsLoaded, setAccountsLoaded] = useState(false);
+
+  // Orders state
+  const [executions, setExecutions] = useState<Execution[]>([]);
+  const [positionsTab, setPositionsTab] = useState<"positions" | "orders">("positions");
+  const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);
 
   // Risk tab state
   const [riskWindow, setRiskWindow] = useState(252);
@@ -288,6 +317,10 @@ export default function DashboardPage() {
   // Stress tab state
   const [stressTests, setStressTests] = useState<StressTests | null>(null);
   const [stressLoading, setStressLoading] = useState(false);
+
+  // Track whether risk/stress data is stale due to position changes
+  const riskStaleRef = useRef(false);
+  const stressStaleRef = useRef(false);
 
   // Macro tab state
   const [macroData, setMacroData] = useState<MacroSummary | null>(null);
@@ -321,14 +354,49 @@ export default function DashboardPage() {
     activeTabRef.current = activeTab;
   }, [activeTab]);
 
+  useEffect(() => {
+    if (selectedAccount) {
+      localStorage.setItem(ACCOUNT_STORAGE_KEY, selectedAccount);
+    }
+  }, [selectedAccount]);
+
+  useEffect(() => {
+    let mounted = true;
+    const loadAccounts = async () => {
+      try {
+        const list = await fetchAccounts();
+        if (!mounted) return;
+        setAccounts(list);
+        const stored = localStorage.getItem(ACCOUNT_STORAGE_KEY);
+        let nextAccount: string | null = null;
+        if (stored && list.includes(stored)) {
+          nextAccount = stored;
+        } else if (list.length === 1) {
+          nextAccount = list[0];
+        } else if (list.length > 1) {
+          nextAccount = list[0];
+        }
+        setSelectedAccount(nextAccount);
+      } catch {
+        // If account discovery fails, fall back to unfiltered mode.
+      } finally {
+        if (mounted) setAccountsLoaded(true);
+      }
+    };
+    loadAccounts();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   // ---- Data fetching ------------------------------------------------------
 
   const loadPortfolioAndExposures = useCallback(async (method?: WeightingMethod) => {
     try {
       const m = method ?? weightingMethodRef.current;
       const [pos, exp] = await Promise.all([
-        fetchPortfolio(),
-        fetchExposures(m),
+        fetchPortfolio(selectedAccount ?? undefined),
+        fetchExposures(m, selectedAccount ?? undefined),
       ]);
       setPositions(pos);
       setExposures(exp);
@@ -338,29 +406,44 @@ export default function DashboardPage() {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
     }
-  }, []);
+  }, [selectedAccount]);
 
   const loadAccountSummary = useCallback(async () => {
     try {
-      const summary = await fetchAccountSummary();
+      const [summary, pnl] = await Promise.all([
+        fetchAccountSummary(selectedAccount ?? undefined),
+        fetchDailyPnl(selectedAccount ?? undefined),
+      ]);
       setAccountSummary(summary);
+      setDailyPnl(pnl);
       setError(null);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
     }
-  }, []);
+  }, [selectedAccount]);
+
+  const loadExecutions = useCallback(async () => {
+    try {
+      const execs = await fetchExecutions(selectedAccount ?? undefined);
+      setExecutions(execs);
+    } catch {
+      // Silently degrade — orders are non-critical
+    }
+  }, [selectedAccount]);
 
   const loadAllData = useCallback(async () => {
     try {
-      const [pos, exp, summary] = await Promise.all([
-        fetchPortfolio(),
-        fetchExposures(weightingMethodRef.current),
-        fetchAccountSummary(),
+      const [pos, exp, summary, pnl] = await Promise.all([
+        fetchPortfolio(selectedAccount ?? undefined),
+        fetchExposures(weightingMethodRef.current, selectedAccount ?? undefined),
+        fetchAccountSummary(selectedAccount ?? undefined),
+        fetchDailyPnl(selectedAccount ?? undefined),
       ]);
       setPositions(pos);
       setExposures(exp);
       setAccountSummary(summary);
+      setDailyPnl(pnl);
       setLastUpdate(new Date().toISOString());
       setError(null);
     } catch (err: unknown) {
@@ -369,7 +452,9 @@ export default function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+    // Fetch executions separately (non-blocking)
+    loadExecutions();
+  }, [loadExecutions, selectedAccount]);
 
   const loadRiskData = useCallback(async () => {
     setRiskLoading(true);
@@ -466,7 +551,8 @@ export default function DashboardPage() {
     setWsStatus("reconnecting");
 
     try {
-      const ws = new WebSocket(`${WS_URL}/stream`);
+      const accountParam = selectedAccount ? `?account=${encodeURIComponent(selectedAccount)}` : "";
+      const ws = new WebSocket(`${WS_URL}/stream${accountParam}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -479,19 +565,19 @@ export default function DashboardPage() {
           const msg = JSON.parse(event.data);
           if (msg.type === "position" || msg.type === "portfolio_refresh") {
             loadPortfolioAndExposures();
+            riskStaleRef.current = true;
+            stressStaleRef.current = true;
           } else if (msg.type === "account_summary") {
             loadAccountSummary();
+          } else if (msg.type === "executions") {
+            loadExecutions();
           } else if (msg.type === "risk_updated") {
-            if (activeTabRef.current === "risk") {
-              loadRiskData();
-            }
+            riskStaleRef.current = true;
+            stressStaleRef.current = true;
           } else if (msg.type === "data_updated") {
             loadPortfolioAndExposures();
-            if (activeTabRef.current === "risk") {
-              loadRiskData();
-            }
-          } else {
-            loadPortfolioAndExposures();
+            riskStaleRef.current = true;
+            stressStaleRef.current = true;
           }
         } catch {
           loadPortfolioAndExposures();
@@ -509,7 +595,7 @@ export default function DashboardPage() {
       scheduleReconnect();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadPortfolioAndExposures, loadAccountSummary, loadRiskData]);
+  }, [loadPortfolioAndExposures, loadAccountSummary, selectedAccount]);
 
   function scheduleReconnect() {
     if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
@@ -523,6 +609,7 @@ export default function DashboardPage() {
   // ---- Lifecycle ----------------------------------------------------------
 
   useEffect(() => {
+    if (!accountsLoaded) return;
     loadAllData();
     connectWs();
 
@@ -530,18 +617,20 @@ export default function DashboardPage() {
       if (wsRef.current) wsRef.current.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     };
-  }, [loadAllData, connectWs]);
+  }, [loadAllData, connectWs, accountsLoaded]);
 
   // Load risk data when tab changes to risk
   useEffect(() => {
-    if (activeTab === "risk" && !riskSummary) {
+    if (activeTab === "risk" && (!riskSummary || riskStaleRef.current)) {
+      riskStaleRef.current = false;
       loadRiskData();
     }
   }, [activeTab, riskSummary, loadRiskData]);
 
   // Load stress data when tab changes to stress
   useEffect(() => {
-    if (activeTab === "stress" && !stressTests) {
+    if (activeTab === "stress" && (!stressTests || stressStaleRef.current)) {
+      stressStaleRef.current = false;
       loadStressData();
     }
   }, [activeTab, stressTests, loadStressData]);
@@ -566,13 +655,13 @@ export default function DashboardPage() {
     setWeightingMethod(method);
     weightingMethodRef.current = method;
     try {
-      const exp = await fetchExposures(method);
+      const exp = await fetchExposures(method, selectedAccount ?? undefined);
       setExposures(exp);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
     }
-  }, []);
+  }, [selectedAccount]);
 
   // ---- Sort handler -------------------------------------------------------
 
@@ -680,6 +769,10 @@ export default function DashboardPage() {
           av = Math.abs(a._mktVal);
           bv = Math.abs(b._mktVal);
           break;
+        case "daily_pnl":
+          av = a.daily_pnl;
+          bv = b.daily_pnl;
+          break;
         case "unrealized_pnl":
           av = a.unrealized_pnl;
           bv = b.unrealized_pnl;
@@ -731,6 +824,11 @@ export default function DashboardPage() {
 
   const nlvItem = summaryMap.get("NetLiquidation");
   const nlvValue = nlvItem ? parseFloat(nlvItem.value) : null;
+  const gpvItem = summaryMap.get("GrossPositionValue");
+  const gpvValue = gpvItem ? parseFloat(gpvItem.value) : null;
+  const leverageRatio = gpvValue != null && nlvValue != null && nlvValue !== 0
+    ? gpvValue / nlvValue
+    : null;
 
   // ---- Render: Loading state ----------------------------------------------
 
@@ -750,6 +848,27 @@ export default function DashboardPage() {
       <header className="header">
         <div className="header-left">
           <span className="header-title">Trading Workstation</span>
+          {accounts.length > 1 && (
+            <div className="account-switcher">
+              <span className="account-label">Account</span>
+              <select
+                className="account-select"
+                value={selectedAccount ?? ""}
+                onChange={(e) => setSelectedAccount(e.target.value || null)}
+              >
+                {selectedAccount == null && (
+                  <option value="" disabled>
+                    Select account
+                  </option>
+                )}
+                {accounts.map((acct) => (
+                  <option key={acct} value={acct}>
+                    {acct}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
         </div>
         <div className="header-meta">
           <NotificationCenter />
@@ -812,6 +931,13 @@ export default function DashboardPage() {
         >
           Ticker
         </button>
+        <span style={{ width: 1, height: 16, background: "var(--border-primary)", margin: "0 4px", alignSelf: "center" }} />
+        <button
+          className={`tab-btn${activeTab === "ai" ? " active" : ""}`}
+          onClick={() => setActiveTab("ai")}
+        >
+          AI Search
+        </button>
       </nav>
 
       {/* Overview Tab */}
@@ -827,6 +953,17 @@ export default function DashboardPage() {
             <div className={`nlv-value${nlvValue != null && nlvValue < 0 ? " negative" : ""}`}>
               {nlvValue != null ? fmtCurrency(nlvValue) : "\u2014"}
             </div>
+            {dailyPnl?.nlv_change != null && (
+              <div className={`nlv-daily-change ${dailyPnl.nlv_change > 0 ? "positive" : dailyPnl.nlv_change < 0 ? "negative" : ""}`}>
+                {dailyPnl.nlv_change > 0 ? "+" : ""}{fmtCurrency(dailyPnl.nlv_change)}
+                {dailyPnl.nlv_change_pct != null && (
+                  <span className="nlv-daily-pct">
+                    {" "}({dailyPnl.nlv_change_pct > 0 ? "+" : ""}{dailyPnl.nlv_change_pct.toFixed(2)}%)
+                  </span>
+                )}
+                {" "}today
+              </div>
+            )}
           </div>
           <div className="balances-grid">
             {BALANCE_TAGS_ORDERED.map((tag) => {
@@ -845,6 +982,12 @@ export default function DashboardPage() {
                 </div>
               );
             })}
+            {leverageRatio != null && (
+              <div className="balance-item">
+                <span className="balance-label">Leverage</span>
+                <span className="balance-value">{leverageRatio.toFixed(2)}x</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -945,13 +1088,25 @@ export default function DashboardPage() {
         </span>
       </div>
 
-      {/* Positions table */}
+      {/* Positions / Orders panel */}
       <div className="positions-panel">
         <div className="positions-header">
-          <span className="positions-title">
-            Positions ({sortedPositions.length})
-          </span>
+          <div className="positions-mini-tabs">
+            <button
+              className={`mini-tab-btn${positionsTab === "positions" ? " active" : ""}`}
+              onClick={() => setPositionsTab("positions")}
+            >
+              Positions ({sortedPositions.length})
+            </button>
+            <button
+              className={`mini-tab-btn${positionsTab === "orders" ? " active" : ""}`}
+              onClick={() => setPositionsTab("orders")}
+            >
+              Orders ({executions.length})
+            </button>
+          </div>
         </div>
+        {positionsTab === "positions" && (
         <div className="table-container">
           <table style={{ tableLayout: "fixed" }}>
             <colgroup>
@@ -984,16 +1139,20 @@ export default function DashboardPage() {
             </thead>
             <tbody>
               {sortedPositions.map((p) => {
+                const dpnl = p.daily_pnl;
+                const dpnlClass = dpnl != null && dpnl !== 0
+                  ? dpnl > 0 ? "pnl-positive" : "pnl-negative"
+                  : "";
                 const pnl = p.unrealized_pnl;
-                const pnlClass = pnl != null
-                  ? pnl >= 0 ? "pnl-positive" : "pnl-negative"
+                const pnlClass = pnl != null && pnl !== 0
+                  ? pnl > 0 ? "pnl-positive" : "pnl-negative"
                   : "";
                 const rpnl = p.realized_pnl;
-                const rpnlClass = rpnl != null
-                  ? rpnl >= 0 ? "pnl-positive" : "pnl-negative"
+                const rpnlClass = rpnl != null && rpnl !== 0
+                  ? rpnl > 0 ? "pnl-positive" : "pnl-negative"
                   : "";
-                const pctClass = p._pctChg != null
-                  ? p._pctChg >= 0 ? "pnl-positive" : "pnl-negative"
+                const pctClass = p._pctChg != null && p._pctChg !== 0
+                  ? p._pctChg > 0 ? "pnl-positive" : "pnl-negative"
                   : "";
                 const ccySuffix = p.currency && p.currency !== "USD"
                   ? ` ${p.currency}`
@@ -1019,6 +1178,9 @@ export default function DashboardPage() {
                     </td>
                     <td className="cell-right">
                       {fmtNumber(p._mktVal, 0)}
+                    </td>
+                    <td className={`cell-right ${dpnlClass}`}>
+                      {dpnl != null ? fmtPnl(dpnl) : "\u2014"}
                     </td>
                     <td className={`cell-right ${pnlClass}`}>
                       {pnl != null ? fmtPnl(pnl) : "\u2014"}
@@ -1048,6 +1210,110 @@ export default function DashboardPage() {
             </tbody>
           </table>
         </div>
+        )}
+
+        {/* Orders table */}
+        {positionsTab === "orders" && (
+        <div className="table-container">
+          <table style={{ tableLayout: "fixed" }}>
+            <colgroup>
+              {ORDER_COLUMNS.map((col) => (
+                <col key={col.key} style={{ width: col.defaultWidth }} />
+              ))}
+            </colgroup>
+            <thead>
+              <tr>
+                {ORDER_COLUMNS.map((col) => (
+                  <th
+                    key={col.key}
+                    className={col.align === "right" ? "cell-right" : ""}
+                  >
+                    {col.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {executions.map((ex) => {
+                const sideClass = ex.side === "BUY" ? "pnl-positive" : "pnl-negative";
+                const statusClass =
+                  ex.status === "Filled" ? "pnl-positive" :
+                  ex.status === "Cancelled" ? "pnl-negative" : "";
+                const isExpanded = expandedOrderId === ex.exec_id;
+
+                return (
+                  <Fragment key={ex.exec_id}>
+                    <tr
+                      onClick={() => setExpandedOrderId(isExpanded ? null : ex.exec_id)}
+                      style={{ cursor: "pointer" }}
+                    >
+                      <td>{fmtTimestampET(ex.exec_time)}</td>
+                      <td className="cell-symbol">{ex.symbol}</td>
+                      <td className={sideClass}>{ex.side}</td>
+                      <td>{ex.order_type}</td>
+                      <td className="cell-right">{fmtNumber(ex.quantity, 0)}</td>
+                      <td className="cell-right">
+                        {ex.avg_fill_price != null ? fmtNumber(ex.avg_fill_price) : "\u2014"}
+                      </td>
+                      <td className="cell-right">
+                        {ex.commission != null ? fmtNumber(ex.commission, 2) : "\u2014"}
+                      </td>
+                      <td className={statusClass}>{ex.status}</td>
+                    </tr>
+                    {isExpanded && (
+                      <tr className="order-detail-row">
+                        <td colSpan={ORDER_COLUMNS.length}>
+                          <div className="order-detail">
+                            <div className="order-detail-grid">
+                              <div className="order-detail-field">
+                                <span className="order-detail-label">Order ID</span>
+                                <span className="order-detail-value">{ex.exec_id}</span>
+                              </div>
+                              <div className="order-detail-field">
+                                <span className="order-detail-label">Account</span>
+                                <span className="order-detail-value">{ex.account}</span>
+                              </div>
+                              <div className="order-detail-field">
+                                <span className="order-detail-label">Limit Price</span>
+                                <span className="order-detail-value">
+                                  {ex.lmt_price != null ? fmtNumber(ex.lmt_price) : "\u2014"}
+                                </span>
+                              </div>
+                              <div className="order-detail-field">
+                                <span className="order-detail-label">Filled Qty</span>
+                                <span className="order-detail-value">
+                                  {fmtNumber(ex.filled_qty, 0)} / {fmtNumber(ex.quantity, 0)}
+                                </span>
+                              </div>
+                              {ex.order_ref && (
+                                <div className="order-detail-field">
+                                  <span className="order-detail-label">Ref</span>
+                                  <span className="order-detail-value">{ex.order_ref}</span>
+                                </div>
+                              )}
+                              <div className="order-detail-field">
+                                <span className="order-detail-label">Sec Type</span>
+                                <span className="order-detail-value">{ex.sec_type}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
+              {executions.length === 0 && (
+                <tr>
+                  <td colSpan={ORDER_COLUMNS.length} className="empty-state">
+                    No orders today
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        )}
       </div>
         </>
       )}
@@ -1116,6 +1382,11 @@ export default function DashboardPage() {
         <div className="tab-content">
           <TickerDesk />
         </div>
+      )}
+
+      {/* AI Search */}
+      {activeTab === "ai" && (
+        <AISearch />
       )}
     </div>
   );

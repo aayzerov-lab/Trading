@@ -208,3 +208,16 @@ alerts = Table(
     Column("snoozed_until", DateTime(timezone=True), nullable=True),
     Column("created_at_utc", DateTime(timezone=True), server_default=text("now()")),
 )
+
+# ---------------------------------------------------------------------------
+# Keyword watchlist – user-defined keywords that trigger notifications
+# ---------------------------------------------------------------------------
+
+keyword_watchlist = Table(
+    "keyword_watchlist",
+    phase1_metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("keyword", String, nullable=False, unique=True),
+    Column("enabled", Integer, nullable=False, server_default=text("1")),
+    Column("created_at_utc", DateTime(timezone=True), server_default=text("now()")),
+)
