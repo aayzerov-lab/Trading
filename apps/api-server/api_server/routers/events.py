@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query
@@ -108,9 +109,10 @@ async def list_events(
 
         where_clause = " AND ".join(where_parts)
         query = f"""
-            SELECT id, ts_utc, type, tickers, title, source_name, source_url,
-                   raw_text_snippet, severity_score, reason_codes, llm_summary,
-                   status, metadata_json, created_at_utc, updated_at_utc
+            SELECT id, ts_utc, scheduled_for_utc, type, tickers, title,
+                   source_name, source_url, raw_text_snippet, severity_score,
+                   reason_codes, llm_summary, status, metadata_json,
+                   created_at_utc, updated_at_utc
             FROM events
             WHERE {where_clause}
             ORDER BY ts_utc DESC
@@ -144,9 +146,10 @@ async def high_priority_events(
         logger.info("high_priority_events_request", limit=limit)
 
         query = """
-            SELECT id, ts_utc, type, tickers, title, source_name, source_url,
-                   raw_text_snippet, severity_score, reason_codes, llm_summary,
-                   status, metadata_json, created_at_utc, updated_at_utc
+            SELECT id, ts_utc, scheduled_for_utc, type, tickers, title,
+                   source_name, source_url, raw_text_snippet, severity_score,
+                   reason_codes, llm_summary, status, metadata_json,
+                   created_at_utc, updated_at_utc
             FROM events
             WHERE severity_score >= 80 AND status = 'NEW'
             ORDER BY severity_score DESC, ts_utc DESC
@@ -693,6 +696,308 @@ async def trigger_alert_rules() -> dict[str, Any]:
             status_code=500,
             detail=f"Alert rules failed: {str(e)}",
         )
+
+
+# ---------------------------------------------------------------------------
+# 9. GET /events/portfolio-tickers – Distinct tickers from positions
+# ---------------------------------------------------------------------------
+
+
+@router.get("/portfolio-tickers")
+async def portfolio_tickers():
+    """Return the list of distinct tickers from positions_current where position != 0."""
+    engine = get_shared_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(text(
+            "SELECT DISTINCT UPPER(symbol) as symbol FROM positions_current "
+            "WHERE position != 0 AND symbol IS NOT NULL ORDER BY symbol"
+        ))
+        return [row.symbol for row in result]
+
+
+# ---------------------------------------------------------------------------
+# 10. GET /events/today – Live news tape for today (ET timezone)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/today")
+async def today_events(
+    scope: str = Query(default="my", regex="^(my|all)$"),
+    min_severity: int = Query(default=0, ge=0, le=100),
+    types: str = Query(default="RSS_NEWS,SEC_FILING"),
+    limit: int = Query(default=200, ge=1, le=500),
+    cursor: Optional[str] = Query(default=None),
+):
+    """Live news tape — events from today (America/New_York timezone), newest first."""
+    ET = ZoneInfo("America/New_York")
+
+    now_et = datetime.now(ET)
+    today_start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_start_et = today_start_et + timedelta(days=1)
+    today_start_utc = today_start_et.astimezone(timezone.utc)
+    tomorrow_start_utc = tomorrow_start_et.astimezone(timezone.utc)
+
+    type_list = [t.strip() for t in types.split(",") if t.strip()]
+
+    params: dict[str, Any] = {
+        "today_start": today_start_utc,
+        "tomorrow_start": tomorrow_start_utc,
+        "min_sev": min_severity,
+        "limit": limit,
+    }
+
+    where_parts = [
+        "ts_utc >= :today_start",
+        "ts_utc < :tomorrow_start",
+        "severity_score >= :min_sev",
+    ]
+
+    if type_list:
+        # Build type IN clause
+        type_placeholders = []
+        for i, t in enumerate(type_list):
+            key = f"type_{i}"
+            type_placeholders.append(f":{key}")
+            params[key] = t
+        where_parts.append(f"type IN ({', '.join(type_placeholders)})")
+
+    if cursor:
+        try:
+            cursor_dt = datetime.fromisoformat(cursor)
+            params["cursor_ts"] = cursor_dt
+            where_parts.append("ts_utc < :cursor_ts")
+        except ValueError:
+            pass
+
+    # For scope=my, build portfolio filter
+    portfolio_filter = ""
+    if scope == "my":
+        engine = get_shared_engine()
+        async with engine.connect() as conn:
+            ptickers = await conn.execute(text(
+                "SELECT DISTINCT UPPER(symbol) as symbol FROM positions_current "
+                "WHERE position != 0 AND symbol IS NOT NULL"
+            ))
+            tickers = [r.symbol for r in ptickers]
+
+        if tickers:
+            ticker_conditions = []
+            for i, tk in enumerate(tickers):
+                key = f"ptk_{i}"
+                ticker_conditions.append(f"tickers LIKE :{key}")
+                params[key] = f"%{tk}%"
+            ticker_or = " OR ".join(ticker_conditions)
+            # Include if has portfolio ticker OR is high-severity macro
+            portfolio_filter = f"AND (({ticker_or}) OR severity_score >= 70)"
+        else:
+            portfolio_filter = "AND severity_score >= 70"
+
+    where_clause = " AND ".join(where_parts)
+
+    query = f"""
+        SELECT id, ts_utc, scheduled_for_utc, type, tickers, title,
+               source_name, source_url, raw_text_snippet, severity_score,
+               reason_codes, llm_summary, status, metadata_json,
+               created_at_utc, updated_at_utc
+        FROM events
+        WHERE {where_clause} {portfolio_filter}
+        ORDER BY ts_utc DESC
+        LIMIT :limit
+    """
+
+    engine = get_shared_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(text(query), params)
+        rows = result.mappings().all()
+        return [_serialize_row(dict(row)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# 11. GET /events/calendar – Upcoming scheduled events
+# ---------------------------------------------------------------------------
+
+
+@router.get("/calendar")
+async def calendar_events(
+    days: int = Query(default=30, ge=1, le=365),
+    scope: str = Query(default="my", regex="^(my|all)$"),
+):
+    """Upcoming scheduled events sorted ascending by scheduled_for_utc."""
+    params: dict[str, Any] = {"days": days}
+
+    portfolio_filter = ""
+    if scope == "my":
+        engine = get_shared_engine()
+        async with engine.connect() as conn:
+            ptickers = await conn.execute(text(
+                "SELECT DISTINCT UPPER(symbol) as symbol FROM positions_current "
+                "WHERE position != 0 AND symbol IS NOT NULL"
+            ))
+            tickers = [r.symbol for r in ptickers]
+
+        if tickers:
+            ticker_conditions = []
+            for i, tk in enumerate(tickers):
+                key = f"ctk_{i}"
+                ticker_conditions.append(f"tickers LIKE :{key}")
+                params[key] = f"%{tk}%"
+            ticker_or = " OR ".join(ticker_conditions)
+            portfolio_filter = f"AND (type = 'MACRO_SCHEDULE' OR ({ticker_or}))"
+        else:
+            portfolio_filter = "AND type = 'MACRO_SCHEDULE'"
+
+    query = f"""
+        SELECT id, ts_utc, scheduled_for_utc, type, tickers, title,
+               source_name, source_url, raw_text_snippet, severity_score,
+               reason_codes, llm_summary, status, metadata_json,
+               created_at_utc, updated_at_utc
+        FROM events
+        WHERE scheduled_for_utc IS NOT NULL
+          AND scheduled_for_utc > NOW()
+          AND scheduled_for_utc < NOW() + MAKE_INTERVAL(days => :days)
+          {portfolio_filter}
+        ORDER BY scheduled_for_utc ASC
+    """
+
+    engine = get_shared_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(text(query), params)
+        rows = result.mappings().all()
+
+        now_utc = datetime.now(timezone.utc)
+        return {
+            "items": [_serialize_row(dict(row)) for row in rows],
+            "range": {
+                "start": now_utc.isoformat(),
+                "end": (now_utc + timedelta(days=days)).isoformat(),
+            },
+            "now_utc": now_utc.isoformat(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# 12. GET /events/since – Polling fallback for live updates
+# ---------------------------------------------------------------------------
+
+
+@router.get("/since")
+async def events_since(
+    since_ts: str = Query(description="ISO timestamp — return events newer than this"),
+    scope: str = Query(default="my", regex="^(my|all)$"),
+    min_severity: int = Query(default=0, ge=0, le=100),
+):
+    """Polling fallback — returns events newer than the given timestamp."""
+    try:
+        since_dt = datetime.fromisoformat(since_ts)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid since_ts format")
+
+    params: dict[str, Any] = {"since_ts": since_dt, "min_sev": min_severity}
+
+    portfolio_filter = ""
+    if scope == "my":
+        engine = get_shared_engine()
+        async with engine.connect() as conn:
+            ptickers = await conn.execute(text(
+                "SELECT DISTINCT UPPER(symbol) as symbol FROM positions_current "
+                "WHERE position != 0 AND symbol IS NOT NULL"
+            ))
+            tickers = [r.symbol for r in ptickers]
+
+        if tickers:
+            ticker_conditions = []
+            for i, tk in enumerate(tickers):
+                key = f"stk_{i}"
+                ticker_conditions.append(f"tickers LIKE :{key}")
+                params[key] = f"%{tk}%"
+            ticker_or = " OR ".join(ticker_conditions)
+            portfolio_filter = f"AND (({ticker_or}) OR severity_score >= 70)"
+        else:
+            portfolio_filter = "AND severity_score >= 70"
+
+    query = f"""
+        SELECT id, ts_utc, scheduled_for_utc, type, tickers, title,
+               source_name, source_url, raw_text_snippet, severity_score,
+               reason_codes, llm_summary, status, metadata_json,
+               created_at_utc, updated_at_utc
+        FROM events
+        WHERE ts_utc > :since_ts AND severity_score >= :min_sev
+              {portfolio_filter}
+        ORDER BY ts_utc DESC
+        LIMIT 100
+    """
+
+    engine = get_shared_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(text(query), params)
+        rows = result.mappings().all()
+        return [_serialize_row(dict(row)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# 13. GET /events/ticker/{symbol}/overview – Ticker desk
+# ---------------------------------------------------------------------------
+
+
+@router.get("/ticker/{symbol}/overview")
+async def ticker_overview(
+    symbol: str,
+    days: int = Query(default=7, ge=1, le=90),
+):
+    """Ticker desk — returns position context + events for a specific ticker."""
+    symbol = symbol.upper()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    engine = get_shared_engine()
+    async with engine.connect() as conn:
+        # 1. Position context
+        pos_result = await conn.execute(text(
+            "SELECT symbol, position, avg_cost, market_price, market_value, "
+            "unrealized_pnl, sector, ib_category "
+            "FROM positions_current WHERE UPPER(symbol) = :symbol LIMIT 1"
+        ), {"symbol": symbol})
+        pos_row = pos_result.mappings().first()
+
+        position_context = None
+        if pos_row:
+            pos_dict = dict(pos_row)
+            # Compute weight (needs total MV)
+            total_mv = await conn.execute(text(
+                "SELECT SUM(ABS(market_value)) as tmv FROM positions_current "
+                "WHERE position != 0"
+            ))
+            tmv = total_mv.scalar() or 1
+            pos_dict["weight_pct"] = round(abs(pos_dict.get("market_value", 0)) / tmv * 100, 2)
+            position_context = pos_dict
+
+        # 2. Recent events for this ticker
+        events_result = await conn.execute(text(
+            "SELECT id, ts_utc, scheduled_for_utc, type, tickers, title, "
+            "source_name, source_url, raw_text_snippet, severity_score, "
+            "reason_codes, llm_summary, status, metadata_json, "
+            "created_at_utc, updated_at_utc "
+            "FROM events WHERE tickers LIKE :ticker_pattern AND ts_utc >= :cutoff "
+            "ORDER BY ts_utc DESC LIMIT 50"
+        ), {"ticker_pattern": f"%{symbol}%", "cutoff": cutoff})
+        recent_events = [_serialize_row(dict(r)) for r in events_result.mappings().all()]
+
+        # 3. Upcoming scheduled events for this ticker
+        upcoming_result = await conn.execute(text(
+            "SELECT id, ts_utc, scheduled_for_utc, type, tickers, title, "
+            "source_name, source_url, severity_score, reason_codes, "
+            "status, metadata_json "
+            "FROM events WHERE tickers LIKE :ticker_pattern "
+            "AND scheduled_for_utc IS NOT NULL AND scheduled_for_utc > NOW() "
+            "ORDER BY scheduled_for_utc ASC LIMIT 20"
+        ), {"ticker_pattern": f"%{symbol}%"})
+        upcoming = [_serialize_row(dict(r)) for r in upcoming_result.mappings().all()]
+
+    return {
+        "symbol": symbol,
+        "position": position_context,
+        "events": recent_events,
+        "upcoming": upcoming,
+    }
 
 
 # ---------------------------------------------------------------------------

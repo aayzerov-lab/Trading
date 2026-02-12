@@ -121,6 +121,66 @@ _ISO_DATE_RE = re.compile(
 # Atom namespace
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 
+# ---------------------------------------------------------------------------
+# Company name → ticker aliases (only used for portfolio-held tickers)
+# ---------------------------------------------------------------------------
+
+_HARDCODED_ALIASES: dict[str, str] = {
+    # Mega-cap / well-known
+    "apple": "AAPL", "microsoft": "MSFT", "google": "GOOGL", "alphabet": "GOOGL",
+    "amazon": "AMZN", "tesla": "TSLA", "nvidia": "NVDA", "meta": "META",
+    "facebook": "META", "netflix": "NFLX", "jpmorgan": "JPM", "jp morgan": "JPM",
+    "goldman sachs": "GS", "goldman": "GS", "berkshire": "BRK.B",
+    "johnson & johnson": "JNJ", "procter & gamble": "PG", "coca-cola": "KO",
+    "exxon": "XOM", "exxonmobil": "XOM", "chevron": "CVX",
+    "disney": "DIS", "walmart": "WMT", "intel": "INTC", "amd": "AMD",
+    "broadcom": "AVGO", "salesforce": "CRM", "adobe": "ADBE",
+    "paypal": "PYPL", "uber": "UBER", "airbnb": "ABNB",
+    "palantir": "PLTR", "snowflake": "SNOW", "crowdstrike": "CRWD",
+    "coinbase": "COIN", "robinhood": "HOOD", "sofi": "SOFI",
+    # Semi / materials / portfolio-relevant
+    "applied materials": "AMAT", "lam research": "LRCX", "synopsys": "SNPS",
+    "micron": "MU", "freeport": "FCX", "freeport-mcmoran": "FCX",
+    "southern copper": "SCCO", "coherent": "COHR", "lucid": "LCID",
+    "lucid motors": "LCID", "cameco": "CCJ", "mp materials": "MP",
+    "denison mines": "DNN", "equinox gold": "EQX",
+    "ge vernova": "GEV", "genius sports": "GENI",
+    "bitcoin": "BTC", "ethereum": "ETH",
+}
+
+
+def _build_company_alias_map(
+    portfolio_tickers: set[str],
+) -> dict[str, re.Pattern[str]]:
+    """Build a map of company name aliases to compiled regex patterns.
+
+    Only includes aliases whose corresponding ticker is in the current
+    portfolio, to avoid false positive matches.
+
+    Args:
+        portfolio_tickers: Set of uppercase ticker symbols from portfolio.
+
+    Returns:
+        Dict mapping ticker symbol -> compiled regex that matches any of its
+        aliases as whole words (case-insensitive).
+    """
+    # Invert: group aliases by ticker
+    ticker_to_aliases: dict[str, list[str]] = {}
+    for alias, ticker in _HARDCODED_ALIASES.items():
+        if ticker in portfolio_tickers:
+            ticker_to_aliases.setdefault(ticker, []).append(alias)
+
+    # Compile one regex per ticker with all its aliases OR'd together
+    alias_map: dict[str, re.Pattern[str]] = {}
+    for ticker, aliases in ticker_to_aliases.items():
+        # Sort longest-first so "jp morgan" matches before "jp"
+        aliases.sort(key=len, reverse=True)
+        pattern = "|".join(r"\b" + re.escape(a) + r"\b" for a in aliases)
+        alias_map[ticker] = re.compile(pattern, re.IGNORECASE)
+
+    return alias_map
+
+
 # HTTP request settings
 _HTTP_TIMEOUT = 15.0
 _HTTP_USER_AGENT = "TradingWorkstation-RSS/1.0"
@@ -457,17 +517,24 @@ async def _fetch_feed(feed: dict[str, Any]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _extract_tickers(text_val: str, portfolio_tickers: set[str]) -> list[str]:
+def _extract_tickers(
+    text_val: str,
+    portfolio_tickers: set[str],
+    alias_map: dict[str, re.Pattern[str]] | None = None,
+) -> list[str]:
     """Scan text for ticker mentions and match against portfolio holdings.
 
-    Identifies tickers using three patterns:
+    Identifies tickers using four strategies:
     1. Dollar-prefixed: $AAPL
     2. Exchange-prefixed: (NASDAQ: AAPL), (NYSE: TSLA)
     3. Bare uppercase: AAPL (only if it matches a known portfolio ticker)
+    4. Company name aliases: "Apple reports earnings" -> AAPL
 
     Args:
         text_val: Combined title + description text to scan.
         portfolio_tickers: Set of uppercase ticker symbols from portfolio.
+        alias_map: Optional dict of ticker -> compiled regex for company name
+            aliases. Built by _build_company_alias_map().
 
     Returns:
         Sorted list of matched ticker symbols (uppercase, deduplicated).
@@ -500,6 +567,13 @@ def _extract_tickers(text_val: str, portfolio_tickers: set[str]) -> list[str]:
             and ticker in portfolio_tickers
         ):
             matched.add(ticker)
+
+    # Pattern 4: Company name aliases (e.g., "Apple" -> AAPL)
+    if alias_map:
+        lower_text = text_val.lower()
+        for ticker, pattern in alias_map.items():
+            if pattern.search(lower_text):
+                matched.add(ticker)
 
     return sorted(matched)
 
@@ -659,10 +733,15 @@ async def sync_rss_feeds(
 
     # Get portfolio tickers for matching
     portfolio_tickers = await _get_portfolio_tickers(engine)
+
+    # Build company name alias map for headline matching
+    alias_map = _build_company_alias_map(portfolio_tickers)
+
     logger.info(
         "rss_sync_started",
         feed_count=len(feeds),
         portfolio_tickers=len(portfolio_tickers),
+        company_aliases=len(alias_map),
         lookback_hours=lookback_hours,
     )
 
@@ -706,7 +785,7 @@ async def sync_rss_feeds(
             search_text = " ".join(
                 filter(None, [article.get("title", ""), article.get("description", "")])
             )
-            matched_tickers = _extract_tickers(search_text, portfolio_tickers)
+            matched_tickers = _extract_tickers(search_text, portfolio_tickers, alias_map)
 
             if matched_tickers:
                 feed_ticker_matches += len(matched_tickers)

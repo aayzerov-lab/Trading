@@ -44,6 +44,9 @@ import ClustersPanel from "@/components/ClustersPanel";
 import StressPanel from "@/components/StressPanel";
 import MacroStrip from "@/components/MacroStrip";
 import EventsPanel from "@/components/EventsPanel";
+import LiveTape from "@/components/LiveTape";
+import CalendarView from "@/components/CalendarView";
+import TickerDesk from "@/components/TickerDesk";
 import NotificationCenter from "@/components/NotificationCenter";
 import DataQualityPanel from "@/components/DataQualityPanel";
 import RiskMetadataPanel from "@/components/RiskMetadataPanel";
@@ -189,7 +192,7 @@ function fmtTimestampET(iso: string | null): string {
 type WsStatus = "connected" | "disconnected" | "reconnecting";
 type WeightingMethod = "market_value" | "cost_basis";
 type SortDir = "asc" | "desc";
-type TabName = "overview" | "risk" | "stress" | "macro" | "events";
+type TabName = "overview" | "risk" | "stress" | "macro" | "live" | "calendar" | "ticker";
 
 interface ColumnDef {
   key: string;
@@ -790,11 +793,24 @@ export default function DashboardPage() {
         >
           Macro
         </button>
+        <span style={{ width: 1, height: 16, background: "var(--border-primary)", margin: "0 4px", alignSelf: "center" }} />
         <button
-          className={`tab-btn${activeTab === "events" ? " active" : ""}`}
-          onClick={() => setActiveTab("events")}
+          className={`tab-btn${activeTab === "live" ? " active" : ""}`}
+          onClick={() => setActiveTab("live")}
         >
-          Events
+          Live
+        </button>
+        <button
+          className={`tab-btn${activeTab === "calendar" ? " active" : ""}`}
+          onClick={() => setActiveTab("calendar")}
+        >
+          Calendar
+        </button>
+        <button
+          className={`tab-btn${activeTab === "ticker" ? " active" : ""}`}
+          onClick={() => setActiveTab("ticker")}
+        >
+          Ticker
         </button>
       </nav>
 
@@ -1081,10 +1097,24 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Events Tab */}
-      {activeTab === "events" && (
+      {/* Live News Tape */}
+      {activeTab === "live" && (
         <div className="tab-content">
-          <EventsPanel />
+          <LiveTape />
+        </div>
+      )}
+
+      {/* Calendar */}
+      {activeTab === "calendar" && (
+        <div className="tab-content">
+          <CalendarView />
+        </div>
+      )}
+
+      {/* Ticker Desk */}
+      {activeTab === "ticker" && (
+        <div className="tab-content">
+          <TickerDesk />
         </div>
       )}
     </div>

@@ -157,6 +157,7 @@ events = Table(
     phase1_metadata,
     Column("id", String, primary_key=True),
     Column("ts_utc", DateTime(timezone=True), nullable=False),
+    Column("scheduled_for_utc", DateTime(timezone=True), nullable=True),
     Column("type", String, nullable=False),
     Column("tickers", Text, nullable=True),
     Column("title", Text, nullable=False),

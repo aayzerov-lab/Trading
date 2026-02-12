@@ -95,4 +95,42 @@ async def init_phase1_db(postgres_url: str) -> None:
     engine = get_shared_engine(postgres_url)
     async with engine.begin() as conn:
         await conn.run_sync(phase1_metadata.create_all)
+
+    # Run incremental migrations for columns added after initial create
+    await _run_phase1_migrations(engine)
     logger.info("phase1_db_initialized")
+
+
+async def _run_phase1_migrations(engine: AsyncEngine) -> None:
+    """Add columns that were introduced after initial table creation."""
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        # Phase 3: Add scheduled_for_utc to events table
+        await conn.execute(text(
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS "
+            "scheduled_for_utc TIMESTAMPTZ"
+        ))
+        # Backfill: for MACRO_SCHEDULE events, copy ts_utc → scheduled_for_utc
+        await conn.execute(text(
+            "UPDATE events SET scheduled_for_utc = ts_utc "
+            "WHERE type = 'MACRO_SCHEDULE' AND scheduled_for_utc IS NULL"
+        ))
+        # Add indexes for the new views
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_events_ts_utc_desc "
+            "ON events (ts_utc DESC)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_events_scheduled_for "
+            "ON events (scheduled_for_utc ASC) WHERE scheduled_for_utc IS NOT NULL"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_events_severity "
+            "ON events (severity_score DESC)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_events_type_status "
+            "ON events (type, status)"
+        ))
+    logger.info("phase1_migrations_applied")

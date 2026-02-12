@@ -439,6 +439,7 @@ def _schedule_to_event(release: dict[str, Any], release_date: date, *, estimated
     return {
         "id": event_id,
         "ts_utc": release_dt_utc,
+        "scheduled_for_utc": release_dt_utc,
         "type": "MACRO_SCHEDULE",
         "tickers": None,
         "title": f"{release['name']} \u2014 {release_date.strftime('%b %d, %Y')}",
@@ -547,14 +548,16 @@ async def sync_macro_schedule(
                 result = await conn.execute(
                     text("""
                         INSERT INTO events (
-                            id, ts_utc, type, tickers, title, source_name,
-                            source_url, raw_text_snippet, severity_score,
-                            reason_codes, llm_summary, status, metadata_json
+                            id, ts_utc, scheduled_for_utc, type, tickers,
+                            title, source_name, source_url, raw_text_snippet,
+                            severity_score, reason_codes, llm_summary,
+                            status, metadata_json
                         )
                         VALUES (
-                            :id, :ts_utc, :type, :tickers, :title, :source_name,
-                            :source_url, :raw_text_snippet, :severity_score,
-                            :reason_codes, :llm_summary, :status, :metadata_json
+                            :id, :ts_utc, :scheduled_for_utc, :type, :tickers,
+                            :title, :source_name, :source_url, :raw_text_snippet,
+                            :severity_score, :reason_codes, :llm_summary,
+                            :status, :metadata_json
                         )
                         ON CONFLICT (id) DO NOTHING
                     """),

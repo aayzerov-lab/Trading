@@ -13,6 +13,7 @@ export type AlertStatus = 'NEW' | 'READ' | 'SNOOZED' | 'DISMISSED';
 export interface Event {
   id: string;
   ts_utc: string;
+  scheduled_for_utc: string | null;
   type: EventType;
   tickers: string[] | null;
   title: string;
