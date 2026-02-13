@@ -13,6 +13,13 @@ from __future__ import annotations
 import asyncio
 import sys
 
+# Ensure an event loop exists before importing ib_insync / eventkit.
+# Python 3.12+ removed the implicit loop creation on get_event_loop().
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 import structlog
 
 from broker_bridge.bridge import IBBridge
