@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -736,10 +737,11 @@ class IBBridge:
         Uses ``ib_insync.util.run()`` / the ib_insync event-loop integration.
         Registers SIGINT and SIGTERM for graceful shutdown.
         """
-        # Register signal handlers
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._request_shutdown)
+        # Register signal handlers (Unix only; Windows uses KeyboardInterrupt)
+        if sys.platform != "win32":
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self._request_shutdown)
 
         # Connect (with back-off)
         self.connect_with_backoff()
