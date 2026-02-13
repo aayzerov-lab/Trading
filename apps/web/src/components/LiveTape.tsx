@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { API_URL } from "@/lib/api";
+import { API_URL, fetchWithRetry } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -230,7 +230,7 @@ export default function LiveTape() {
     const minSev = highOnly ? 75 : 0;
     const url = `${API_URL}/events/today?scope=${scope}&min_severity=${minSev}&types=RSS_NEWS,SEC_FILING&limit=${MAX_ITEMS}`;
     try {
-      const res = await fetch(url);
+      const res = await fetchWithRetry(url);
       if (!res.ok) return;
       const data: Event[] = await res.json();
       const normed = data.map(normalize).slice(0, MAX_ITEMS);
@@ -247,7 +247,7 @@ export default function LiveTape() {
     const minSev = highOnly ? 75 : 0;
     const url = `${API_URL}/events/since?since_ts=${encodeURIComponent(latestTs.current)}&scope=${scope}&min_severity=${minSev}&types=RSS_NEWS,SEC_FILING`;
     try {
-      const res = await fetch(url);
+      const res = await fetchWithRetry(url);
       if (!res.ok) return;
       const fresh: Event[] = await res.json();
       if (fresh.length === 0) return;
@@ -265,7 +265,7 @@ export default function LiveTape() {
   // -- status update -------------------------------------------------------
   const handleStatus = useCallback(async (id: string, status: "ACKED" | "DISMISSED") => {
     setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, status } : e)));
-    try { await fetch(`${API_URL}/events/${id}/status`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }); }
+    try { await fetchWithRetry(`${API_URL}/events/${id}/status`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }); }
     catch { /* revert on error would go here */ }
   }, []);
 

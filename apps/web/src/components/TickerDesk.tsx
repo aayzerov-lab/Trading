@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { API_URL } from "@/lib/api";
+import { API_URL, fetchWithRetry } from "@/lib/api";
 import { Event, EventType, EventStatus, updateEventStatus } from "@/lib/events-api";
 
 // ---- Types ------------------------------------------------------------------
@@ -155,7 +155,7 @@ export default function TickerDesk() {
   useEffect(() => {
     (async () => {
       try {
-        const res = await fetch(`${API_URL}/events/portfolio-tickers`);
+        const res = await fetchWithRetry(`${API_URL}/events/portfolio-tickers`);
         if (res.ok) setTickers(await res.json());
       } catch { /* degrade */ }
       finally { setLoading(false); }
@@ -167,7 +167,7 @@ export default function TickerDesk() {
     setDetailLoading(true);
     setExpandedId(null);
     try {
-      const res = await fetch(`${API_URL}/events/ticker/${encodeURIComponent(sym)}/overview?days=${d}`);
+      const res = await fetchWithRetry(`${API_URL}/events/ticker/${encodeURIComponent(sym)}/overview?days=${d}`);
       if (!res.ok) throw new Error("fetch failed");
       const raw = await res.json();
       const ov: TickerOverview = {

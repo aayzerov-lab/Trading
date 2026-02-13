@@ -24,7 +24,7 @@ import structlog
 
 from broker_bridge.bridge import IBBridge
 from broker_bridge.config import get_settings
-from broker_bridge.db import close_db, init_db
+from broker_bridge.db import clear_stale_data, close_db, init_db
 from broker_bridge.publisher import RedisPublisher
 
 
@@ -65,6 +65,7 @@ def main() -> None:
 
     # --- Database ----------------------------------------------------------
     loop.run_until_complete(init_db(settings.POSTGRES_URL))
+    loop.run_until_complete(clear_stale_data())
 
     # --- Redis -------------------------------------------------------------
     publisher = RedisPublisher(settings.REDIS_URL)

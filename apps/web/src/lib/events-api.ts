@@ -2,7 +2,7 @@
 // Events & Alerts API client – types & fetchers for the events system
 // ---------------------------------------------------------------------------
 
-import { API_URL } from './api';
+import { API_URL, fetchWithRetry } from './api';
 
 // ---- Types ----------------------------------------------------------------
 
@@ -82,7 +82,7 @@ export async function fetchEvents(params?: {
   if (params?.limit) sp.set('limit', String(params.limit));
   if (params?.offset) sp.set('offset', String(params.offset));
   const qs = sp.toString();
-  const res = await fetch(`${API_URL}/events${qs ? '?' + qs : ''}`);
+  const res = await fetchWithRetry(`${API_URL}/events${qs ? '?' + qs : ''}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch events: ${res.status} ${res.statusText}`);
   }
@@ -91,7 +91,7 @@ export async function fetchEvents(params?: {
 }
 
 export async function fetchHighPriorityEvents(limit: number = 20): Promise<Event[]> {
-  const res = await fetch(`${API_URL}/events/high-priority?limit=${limit}`);
+  const res = await fetchWithRetry(`${API_URL}/events/high-priority?limit=${limit}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch high-priority events: ${res.status} ${res.statusText}`);
   }
@@ -100,7 +100,7 @@ export async function fetchHighPriorityEvents(limit: number = 20): Promise<Event
 }
 
 export async function updateEventStatus(id: string, status: EventStatus): Promise<void> {
-  const res = await fetch(`${API_URL}/events/${id}/status`, {
+  const res = await fetchWithRetry(`${API_URL}/events/${id}/status`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ status }),
@@ -111,7 +111,7 @@ export async function updateEventStatus(id: string, status: EventStatus): Promis
 }
 
 export async function fetchEventStats(): Promise<EventStats> {
-  const res = await fetch(`${API_URL}/events/stats`);
+  const res = await fetchWithRetry(`${API_URL}/events/stats`);
   if (!res.ok) {
     throw new Error(`Failed to fetch event stats: ${res.status} ${res.statusText}`);
   }
@@ -130,7 +130,7 @@ export async function fetchAlerts(
   if (alertType) sp.set('type', alertType);
   sp.set('limit', String(limit));
   const qs = sp.toString();
-  const res = await fetch(`${API_URL}/events/alerts${qs ? '?' + qs : ''}`);
+  const res = await fetchWithRetry(`${API_URL}/events/alerts${qs ? '?' + qs : ''}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch alerts: ${res.status} ${res.statusText}`);
   }
@@ -141,7 +141,7 @@ export async function fetchUnreadAlertCount(alertType?: string): Promise<number>
   const sp = new URLSearchParams();
   if (alertType) sp.set('type', alertType);
   const qs = sp.toString();
-  const res = await fetch(`${API_URL}/events/alerts/unread-count${qs ? '?' + qs : ''}`);
+  const res = await fetchWithRetry(`${API_URL}/events/alerts/unread-count${qs ? '?' + qs : ''}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch unread alert count: ${res.status} ${res.statusText}`);
   }
@@ -158,7 +158,7 @@ export async function updateAlertStatus(
   if (snoozeHours !== undefined) {
     body.snooze_hours = snoozeHours;
   }
-  const res = await fetch(`${API_URL}/events/alerts/${id}/status`, {
+  const res = await fetchWithRetry(`${API_URL}/events/alerts/${id}/status`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -172,7 +172,7 @@ export async function markAllAlertsRead(alertType?: string): Promise<{ ok: boole
   const sp = new URLSearchParams();
   if (alertType) sp.set('type', alertType);
   const qs = sp.toString();
-  const res = await fetch(`${API_URL}/events/alerts/mark-all-read${qs ? '?' + qs : ''}`, {
+  const res = await fetchWithRetry(`${API_URL}/events/alerts/mark-all-read${qs ? '?' + qs : ''}`, {
     method: 'POST',
   });
   if (!res.ok) {
@@ -182,7 +182,7 @@ export async function markAllAlertsRead(alertType?: string): Promise<{ ok: boole
 }
 
 export async function seedEvents(): Promise<{ seeded: boolean; events: number; alerts: number }> {
-  const res = await fetch(`${API_URL}/events/seed`, { method: 'POST' });
+  const res = await fetchWithRetry(`${API_URL}/events/seed`, { method: 'POST' });
   if (!res.ok) {
     throw new Error(`Failed to seed events: ${res.status} ${res.statusText}`);
   }
@@ -199,13 +199,13 @@ export interface Keyword {
 }
 
 export async function fetchKeywords(): Promise<Keyword[]> {
-  const res = await fetch(`${API_URL}/events/keywords`);
+  const res = await fetchWithRetry(`${API_URL}/events/keywords`);
   if (!res.ok) throw new Error(`Failed to fetch keywords: ${res.status}`);
   return res.json();
 }
 
 export async function addKeyword(keyword: string): Promise<{ ok: boolean; id?: number; keyword?: string }> {
-  const res = await fetch(`${API_URL}/events/keywords`, {
+  const res = await fetchWithRetry(`${API_URL}/events/keywords`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ keyword }),
@@ -215,6 +215,6 @@ export async function addKeyword(keyword: string): Promise<{ ok: boolean; id?: n
 }
 
 export async function deleteKeyword(id: number): Promise<void> {
-  const res = await fetch(`${API_URL}/events/keywords/${id}`, { method: 'DELETE' });
+  const res = await fetchWithRetry(`${API_URL}/events/keywords/${id}`, { method: 'DELETE' });
   if (!res.ok) throw new Error(`Failed to delete keyword: ${res.status}`);
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { API_URL } from "@/lib/api";
+import { API_URL, fetchWithRetry } from "@/lib/api";
 
 // -- Types ------------------------------------------------------------------
 
@@ -194,7 +194,7 @@ export default function CalendarView() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/events/calendar?days=${days}&scope=${scope}`);
+      const res = await fetchWithRetry(`${API_URL}/events/calendar?days=${days}&scope=${scope}`);
       if (!res.ok) throw new Error(res.statusText);
       const data = await res.json();
       const items: CalendarEvent[] = (data.items ?? []).map(normalize);

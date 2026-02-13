@@ -17,6 +17,38 @@ function buildQuery(params: Record<string, string | undefined>): string {
   return s ? `?${s}` : "";
 }
 
+// ---------------------------------------------------------------------------
+// Fetch with timeout + auto-retry (handles cold-start on Render/serverless)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_TIMEOUT_MS = 20_000;
+const RETRY_DELAY_MS = 2_000;
+const MAX_RETRIES = 3;
+
+export async function fetchWithRetry(
+  url: string,
+  init?: RequestInit & { timeoutMs?: number; retries?: number }
+): Promise<Response> {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, retries = MAX_RETRIES, ...fetchInit } = init ?? {};
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...fetchInit, signal: controller.signal });
+      clearTimeout(timer);
+      return res;
+    } catch (err: unknown) {
+      clearTimeout(timer);
+      lastError = err;
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+      }
+    }
+  }
+  throw lastError;
+}
+
 // ---- Domain types ---------------------------------------------------------
 
 export interface Position {
@@ -46,6 +78,7 @@ export interface Exposure {
   name: string;
   weight: number;
   notional: number;
+  symbols: string[];
 }
 
 export interface ExposureResponse {
@@ -94,7 +127,7 @@ export interface Execution {
 // ---- Fetchers -------------------------------------------------------------
 
 export async function fetchPortfolio(account?: string): Promise<Position[]> {
-  const res = await fetch(`${API_URL}/portfolio${buildQuery({ account })}`);
+  const res = await fetchWithRetry(`${API_URL}/portfolio${buildQuery({ account })}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch portfolio: ${res.status} ${res.statusText}`);
   }
@@ -115,7 +148,7 @@ export async function fetchExposures(
 }
 
 export async function fetchAccountSummary(account?: string): Promise<AccountSummaryItem[]> {
-  const res = await fetch(`${API_URL}/account/summary${buildQuery({ account })}`);
+  const res = await fetchWithRetry(`${API_URL}/account/summary${buildQuery({ account })}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch account summary: ${res.status} ${res.statusText}`);
   }
@@ -123,7 +156,7 @@ export async function fetchAccountSummary(account?: string): Promise<AccountSumm
 }
 
 export async function fetchDailyPnl(account?: string): Promise<DailyPnl> {
-  const res = await fetch(`${API_URL}/account/daily-pnl${buildQuery({ account })}`);
+  const res = await fetchWithRetry(`${API_URL}/account/daily-pnl${buildQuery({ account })}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch daily P&L: ${res.status} ${res.statusText}`);
   }
@@ -131,7 +164,7 @@ export async function fetchDailyPnl(account?: string): Promise<DailyPnl> {
 }
 
 export async function fetchExecutions(account?: string): Promise<Execution[]> {
-  const res = await fetch(`${API_URL}/executions${buildQuery({ account })}`);
+  const res = await fetchWithRetry(`${API_URL}/executions${buildQuery({ account })}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch executions: ${res.status} ${res.statusText}`);
   }
@@ -139,7 +172,7 @@ export async function fetchExecutions(account?: string): Promise<Execution[]> {
 }
 
 export async function fetchAccounts(): Promise<string[]> {
-  const res = await fetch(`${API_URL}/accounts`);
+  const res = await fetchWithRetry(`${API_URL}/accounts`);
   if (!res.ok) {
     throw new Error(`Failed to fetch accounts: ${res.status} ${res.statusText}`);
   }

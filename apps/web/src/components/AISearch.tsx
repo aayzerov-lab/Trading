@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { API_URL } from "@/lib/api";
+import { API_URL, fetchWithRetry } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -132,7 +132,7 @@ export default function AISearch() {
     const payload = { messages: buildPayload(updatedMessages) };
 
     try {
-      const response = await fetch(`${API_URL}/ai/chat`, {
+      const response = await fetchWithRetry(`${API_URL}/ai/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

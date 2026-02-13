@@ -243,6 +243,15 @@ async def init_db(postgres_url: str) -> None:
     logger.info("database_initialised")
 
 
+async def clear_stale_data() -> None:
+    """Truncate position and account data so only fresh IB data is shown."""
+    if _engine is None:
+        return
+    async with _engine.begin() as conn:
+        await conn.execute(text("TRUNCATE positions_current, account_summary"))
+    logger.info("stale_data_cleared")
+
+
 async def close_db() -> None:
     """Dispose of the connection pool."""
     global _engine

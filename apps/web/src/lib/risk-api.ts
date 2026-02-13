@@ -2,7 +2,7 @@
 // Risk API client – types & fetchers for risk endpoints
 // ---------------------------------------------------------------------------
 
-import { API_URL } from './api';
+import { API_URL, fetchWithRetry } from './api';
 
 // ---- Types ----------------------------------------------------------------
 
@@ -109,7 +109,7 @@ export async function fetchRiskSummary(
   window: number = 252,
   method: string = 'lw'
 ): Promise<RiskSummary> {
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${API_URL}/risk/summary?window=${window}&method=${method}`
   );
   if (!res.ok) {
@@ -122,7 +122,7 @@ export async function fetchRiskContributors(
   window: number = 252,
   method: string = 'lw'
 ): Promise<RiskContributor[]> {
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${API_URL}/risk/contributors?window=${window}&method=${method}`
   );
   if (!res.ok) {
@@ -135,7 +135,7 @@ export async function fetchCorrelationPairs(
   window: number = 252,
   n: number = 20
 ): Promise<CorrelationPair[]> {
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${API_URL}/risk/correlation/pairs?window=${window}&n=${n}`
   );
   if (!res.ok) {
@@ -147,7 +147,7 @@ export async function fetchCorrelationPairs(
 export async function fetchClusters(
   window: number = 252
 ): Promise<ClusterInfo[]> {
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${API_URL}/risk/clusters?window=${window}`
   );
   if (!res.ok) {
@@ -157,7 +157,7 @@ export async function fetchClusters(
 }
 
 export async function fetchStressTests(): Promise<StressTests> {
-  const res = await fetch(`${API_URL}/risk/stress`);
+  const res = await fetchWithRetry(`${API_URL}/risk/stress`);
   if (!res.ok) {
     throw new Error(`Failed to fetch stress tests: ${res.status} ${res.statusText}`);
   }
@@ -165,7 +165,7 @@ export async function fetchStressTests(): Promise<StressTests> {
 }
 
 export async function fetchMacroOverview(): Promise<MacroSummary> {
-  const res = await fetch(`${API_URL}/macro/summary`);
+  const res = await fetchWithRetry(`${API_URL}/macro/summary`);
   if (!res.ok) {
     throw new Error(`Failed to fetch macro overview: ${res.status} ${res.statusText}`);
   }
@@ -256,19 +256,19 @@ export interface RiskMetadata {
 }
 
 export async function fetchDataQuality(window: number = 252, method: string = 'lw'): Promise<DataQualityPack> {
-  const res = await fetch(`${API_URL}/risk/data-quality?window=${window}&method=${method}`);
+  const res = await fetchWithRetry(`${API_URL}/risk/data-quality?window=${window}&method=${method}`);
   if (!res.ok) throw new Error(`Failed to fetch data quality: ${res.status} ${res.statusText}`);
   return res.json();
 }
 
 export async function fetchRiskMetadata(window: number = 252, method: string = 'lw'): Promise<RiskMetadata> {
-  const res = await fetch(`${API_URL}/risk/metadata?window=${window}&method=${method}`);
+  const res = await fetchWithRetry(`${API_URL}/risk/metadata?window=${window}&method=${method}`);
   if (!res.ok) throw new Error(`Failed to fetch risk metadata: ${res.status} ${res.statusText}`);
   return res.json();
 }
 
 export async function triggerRiskRecompute(): Promise<void> {
-  const res = await fetch(`${API_URL}/risk/recompute`, { method: 'POST' });
+  const res = await fetchWithRetry(`${API_URL}/risk/recompute`, { method: 'POST' });
   if (!res.ok) {
     throw new Error(`Failed to trigger risk recompute: ${res.status} ${res.statusText}`);
   }
