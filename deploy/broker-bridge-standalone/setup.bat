@@ -3,7 +3,7 @@ setlocal EnableDelayedExpansion
 
 echo.
 echo =========================================
-echo   Trading Dashboard — Broker Bridge Setup
+echo   Trading Dashboard - Broker Bridge Setup
 echo =========================================
 echo.
 
@@ -37,7 +37,7 @@ REM ---- Interactive .env creation ----
 if exist .env goto :start_bridge
 
 echo =========================================
-echo   First-time setup — 2 quick questions
+echo   First-time setup - 2 quick questions
 echo =========================================
 echo.
 
