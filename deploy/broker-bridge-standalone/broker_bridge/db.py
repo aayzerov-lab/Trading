@@ -6,6 +6,7 @@ upsert / query helpers.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -187,13 +188,16 @@ def _get_engine(postgres_url: str) -> AsyncEngine:
         elif url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql+asyncpg://", 1)
 
-        _engine = create_async_engine(
-            url,
+        kwargs: dict[str, Any] = dict(
             pool_size=5,
             max_overflow=10,
             pool_pre_ping=True,
             pool_recycle=3600,
         )
+        if os.environ.get("DB_SSL", "").lower() in ("1", "true", "yes"):
+            kwargs["connect_args"] = {"ssl": "require"}
+
+        _engine = create_async_engine(url, **kwargs)
     return _engine
 
 

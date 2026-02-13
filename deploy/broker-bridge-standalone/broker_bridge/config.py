@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     IB_PORT: int = 4002
     IB_CLIENT_ID: int = 1
     POSTGRES_URL: str
-    REDIS_URL: str
+    REDIS_URL: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
