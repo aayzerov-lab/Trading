@@ -161,6 +161,7 @@ a:hover { text-decoration: underline; }
 }
 
 .status-dot.connected    { background: var(--green); box-shadow: 0 0 4px var(--green); }
+.status-dot.polling      { background: var(--yellow); }
 .status-dot.disconnected { background: var(--red); }
 .status-dot.reconnecting { background: var(--yellow); }
 

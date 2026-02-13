@@ -338,6 +338,7 @@ export default function DashboardPage() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectDelay = useRef(1000);
+  const pollingTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const weightingMethodRef = useRef<WeightingMethod>(weightingMethod);
   const activeTabRef = useRef<TabName>(activeTab);
 
@@ -558,6 +559,10 @@ export default function DashboardPage() {
       ws.onopen = () => {
         setWsStatus("connected");
         reconnectDelay.current = 1000;
+        if (pollingTimer.current) {
+          clearInterval(pollingTimer.current);
+          pollingTimer.current = null;
+        }
       };
 
       ws.onmessage = (event) => {
@@ -587,6 +592,11 @@ export default function DashboardPage() {
       ws.onclose = () => {
         setWsStatus("disconnected");
         scheduleReconnect();
+        if (!pollingTimer.current) {
+          pollingTimer.current = setInterval(() => {
+            loadAllData();
+          }, 30000);
+        }
       };
 
       ws.onerror = () => {};
@@ -616,6 +626,7 @@ export default function DashboardPage() {
     return () => {
       if (wsRef.current) wsRef.current.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (pollingTimer.current) clearInterval(pollingTimer.current);
     };
   }, [loadAllData, connectWs, accountsLoaded]);
 
@@ -874,12 +885,8 @@ export default function DashboardPage() {
           <NotificationCenter />
           {lastUpdate && <span>{fmtTimestampET(lastUpdate)}</span>}
           <span className="status-indicator">
-            <span className={`status-dot ${wsStatus}`} />
-            {wsStatus === "connected"
-              ? "Live"
-              : wsStatus === "reconnecting"
-              ? "Reconnecting"
-              : "Disconnected"}
+            <span className={`status-dot ${wsStatus === "connected" ? "connected" : "polling"}`} />
+            {wsStatus === "connected" ? "Live" : "Polling"}
           </span>
         </div>
       </header>
