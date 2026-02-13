@@ -87,6 +87,54 @@ CURATED_FEEDS: list[dict[str, Any]] = [
     },
 ]
 
+# Additional feeds used ONLY for keyword alerts.
+# These are intentionally excluded from CURATED_FEEDS so they do not affect
+# the live tape/event feed.
+KEYWORD_ONLY_FEEDS: list[dict[str, Any]] = [
+    {
+        "name": "BBC Business",
+        "url": "https://feeds.bbci.co.uk/news/business/rss.xml",
+        "category": "business",
+        "base_severity": 50,
+    },
+    {
+        "name": "CNN Business",
+        "url": "http://rss.cnn.com/rss/money_latest.rss",
+        "category": "business",
+        "base_severity": 48,
+    },
+    {
+        "name": "NYT Technology",
+        "url": "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
+        "category": "business",
+        "base_severity": 50,
+    },
+    {
+        "name": "NYT World",
+        "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "category": "general",
+        "base_severity": 48,
+    },
+    {
+        "name": "WSJ Markets",
+        "url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+        "category": "markets",
+        "base_severity": 55,
+    },
+    {
+        "name": "NPR Business",
+        "url": "https://feeds.npr.org/1006/rss.xml",
+        "category": "business",
+        "base_severity": 46,
+    },
+    {
+        "name": "Guardian Business",
+        "url": "https://www.theguardian.com/business/rss",
+        "category": "business",
+        "base_severity": 48,
+    },
+]
+
 # ---------------------------------------------------------------------------
 # Common English words to exclude from ticker matching
 # ---------------------------------------------------------------------------

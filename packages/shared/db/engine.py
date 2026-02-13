@@ -135,4 +135,13 @@ async def _run_phase1_migrations(engine: AsyncEngine) -> None:
             "CREATE INDEX IF NOT EXISTS idx_events_type_status "
             "ON events (type, status)"
         ))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_alerts_type_related_event "
+            "ON alerts (type, related_event_id) "
+            "WHERE related_event_id IS NOT NULL"
+        ))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_keyword_watchlist_keyword_lower "
+            "ON keyword_watchlist (LOWER(keyword))"
+        ))
     logger.info("phase1_migrations_applied")

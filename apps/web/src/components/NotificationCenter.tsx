@@ -17,8 +17,8 @@ function timeAgo(iso: string): string {
 }
 
 function severityColor(s: number): string {
-  if (s >= 8) return "var(--red)";
-  if (s >= 5) return "var(--yellow)";
+  if (s >= 80) return "var(--red)";
+  if (s >= 60) return "var(--yellow)";
   return "var(--green)";
 }
 
@@ -101,6 +101,15 @@ const S: Record<string, React.CSSProperties> = {
     borderRadius: 2, padding: "4px 10px", fontSize: 10, cursor: "pointer",
     fontFamily: "var(--font-mono)", fontWeight: 600,
   },
+  error: {
+    margin: "8px 12px 0 12px",
+    padding: "6px 8px",
+    border: "1px solid rgba(255, 59, 59, 0.45)",
+    background: "rgba(255, 59, 59, 0.08)",
+    color: "var(--red)",
+    fontSize: 10,
+    borderRadius: 2,
+  },
 };
 
 type Tab = "alerts" | "keywords";
@@ -113,23 +122,39 @@ export default function NotificationCenter() {
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<Tab>("alerts");
   const [newKw, setNewKw] = useState("");
+  const [alertsError, setAlertsError] = useState<string | null>(null);
+  const [keywordsError, setKeywordsError] = useState<string | null>(null);
+  const [unreadError, setUnreadError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const refreshUnreadCount = useCallback(async () => {
-    try { setUnreadCount(await fetchUnreadAlertCount()); } catch { /* degrade */ }
+    try {
+      setUnreadCount(await fetchUnreadAlertCount());
+      setUnreadError(null);
+    } catch {
+      setUnreadError("Failed to refresh unread count");
+    }
   }, []);
 
   const loadAlerts = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await fetchAlerts(undefined, 50);
+      const data = await fetchAlerts(undefined, 50, "active");
       data.sort((a, b) => new Date(b.ts_utc).getTime() - new Date(a.ts_utc).getTime());
       setAlerts(data);
-    } catch { /* degrade */ } finally { setLoading(false); }
+      setAlertsError(null);
+    } catch {
+      setAlertsError("Failed to load notifications");
+    } finally { setLoading(false); }
   }, []);
 
   const loadKeywords = useCallback(async () => {
-    try { setKeywords(await fetchKeywords()); } catch { /* degrade */ }
+    try {
+      setKeywords(await fetchKeywords());
+      setKeywordsError(null);
+    } catch {
+      setKeywordsError("Failed to load keywords");
+    }
   }, []);
 
   // Poll unread count every 30s
@@ -147,6 +172,13 @@ export default function NotificationCenter() {
     }
   }, [open, loadAlerts, loadKeywords]);
 
+  // While open, refresh active alerts every 15s so state stays current.
+  useEffect(() => {
+    if (!open || tab !== "alerts") return;
+    const id = setInterval(loadAlerts, 15000);
+    return () => clearInterval(id);
+  }, [open, tab, loadAlerts]);
+
   // Close on outside click
   useEffect(() => {
     if (!open) return;
@@ -160,19 +192,30 @@ export default function NotificationCenter() {
   const handleAction = useCallback(async (id: number, status: AlertStatus, snoozeHours?: number) => {
     try {
       await updateAlertStatus(id, status, snoozeHours);
-      setAlerts((prev) => prev.filter((a) => a.id !== id));
+      setAlerts((prev) => {
+        if (status === "SNOOZED") {
+          return prev.map((a) => (a.id === id ? { ...a, status: "SNOOZED" } : a));
+        }
+        return prev.filter((a) => a.id !== id);
+      });
+      setAlertsError(null);
       await refreshUnreadCount();
-    } catch { /* degrade */ }
+    } catch {
+      setAlertsError("Failed to update notification");
+    }
   }, [refreshUnreadCount]);
 
   const handleMarkAllRead = useCallback(async () => {
     const unread = alerts.filter((a) => a.status === "NEW");
+    if (unread.length === 0) return;
     try {
       await Promise.all(unread.map((a) => updateAlertStatus(a.id, "READ")));
-      setAlerts((prev) => prev.map((a) =>
-        a.status === "NEW" ? { ...a, status: "READ" as AlertStatus } : a));
+      setAlerts((prev) => prev.filter((a) => a.status !== "NEW"));
+      setAlertsError(null);
       await refreshUnreadCount();
-    } catch { /* degrade */ }
+    } catch {
+      setAlertsError("Failed to mark all as read");
+    }
   }, [alerts, refreshUnreadCount]);
 
   const handleAddKeyword = useCallback(async () => {
@@ -182,14 +225,23 @@ export default function NotificationCenter() {
       await addKeyword(kw);
       setNewKw("");
       await loadKeywords();
-    } catch { /* degrade */ }
-  }, [newKw, loadKeywords]);
+      setKeywordsError(null);
+      // A new keyword may produce new matches; refresh active alerts now.
+      await loadAlerts();
+      await refreshUnreadCount();
+    } catch {
+      setKeywordsError("Failed to add keyword");
+    }
+  }, [newKw, loadKeywords, loadAlerts, refreshUnreadCount]);
 
   const handleDeleteKeyword = useCallback(async (id: number) => {
     try {
       await deleteKeyword(id);
       setKeywords((prev) => prev.filter((k) => k.id !== id));
-    } catch { /* degrade */ }
+      setKeywordsError(null);
+    } catch {
+      setKeywordsError("Failed to delete keyword");
+    }
   }, []);
 
   return (
@@ -236,9 +288,12 @@ export default function NotificationCenter() {
                 <span style={S.title as React.CSSProperties}>Notifications</span>
                 <button onClick={handleMarkAllRead} style={S.markAll}>Mark all read</button>
               </div>
+              {(alertsError || unreadError) && (
+                <div style={S.error}>{alertsError || unreadError}</div>
+              )}
 
               {loading && alerts.length === 0 && <div style={S.empty}>Loading...</div>}
-              {!loading && alerts.length === 0 && <div style={S.empty}>No notifications</div>}
+              {!loading && alerts.length === 0 && <div style={S.empty}>No active notifications</div>}
 
               {alerts.map((a) => (
                 <div key={a.id} style={{
@@ -277,6 +332,7 @@ export default function NotificationCenter() {
               <div style={{ fontSize: 10, color: "var(--text-dimmed)", marginBottom: 8 }}>
                 Add keywords to get notified when they appear in news headlines.
               </div>
+              {keywordsError && <div style={S.error}>{keywordsError}</div>}
 
               {keywords.length === 0 && (
                 <div style={S.empty}>No keywords set. Add one below.</div>

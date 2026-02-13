@@ -329,14 +329,25 @@ _alerts_router = APIRouter(prefix="/alerts", tags=["alerts"])
 
 @_alerts_router.get("")
 async def list_alerts(
+    scope: str = Query(
+        default="active",
+        regex="^(active|all|archived)$",
+        description="Alert scope: active (NEW,SNOOZED), archived (READ,DISMISSED), or all",
+    ),
     status: Optional[str] = Query(default=None, description="Filter by alert status"),
     limit: int = Query(default=50, ge=1, le=500, description="Max alerts to return"),
 ) -> list[dict[str, Any]]:
     """Return alerts with optional status filter, ordered by newest first."""
     try:
-        logger.info("list_alerts_request", status=status, limit=limit)
+        logger.info("list_alerts_request", scope=scope, status=status, limit=limit)
 
         params: dict[str, Any] = {"limit": limit}
+        where_parts: list[str] = []
+
+        if scope == "active":
+            where_parts.append("status IN ('NEW', 'SNOOZED')")
+        elif scope == "archived":
+            where_parts.append("status IN ('READ', 'DISMISSED')")
 
         if status is not None:
             if status not in _VALID_ALERT_STATUSES:
@@ -344,10 +355,10 @@ async def list_alerts(
                     status_code=400,
                     detail=f"Invalid status: {status}. Must be one of {sorted(_VALID_ALERT_STATUSES)}",
                 )
-            where = "WHERE status = :status"
+            where_parts.append("status = :status")
             params["status"] = status
-        else:
-            where = ""
+
+        where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
         query = f"""
             SELECT id, ts_utc, type, message, severity, related_event_id,
@@ -734,10 +745,11 @@ async def trigger_scoring() -> dict[str, Any]:
 async def trigger_alert_rules() -> dict[str, Any]:
     """Manually trigger alert rule evaluation."""
     try:
-        from shared.data.alert_rules import run_alert_rules
+        from shared.data.alert_rules import cleanup_expired_snoozes, run_alert_rules
 
         engine = get_shared_engine()
         stats = await run_alert_rules(engine=engine)
+        stats["snoozes_cleared"] = await cleanup_expired_snoozes(engine=engine)
         return stats
     except Exception as e:
         logger.exception("alert_rules_trigger_failed")
@@ -1124,7 +1136,17 @@ async def add_keyword(body: KeywordCreate) -> dict[str, Any]:
             row = result.first()
             if row is None:
                 return {"ok": True, "message": "Keyword already exists"}
-            return {"ok": True, "id": row[0], "keyword": kw.lower()}
+
+        # Best-effort immediate evaluation so newly-added keywords can produce
+        # notifications without waiting for the periodic sync loop.
+        try:
+            from shared.data.alert_rules import run_alert_rules
+
+            await run_alert_rules(engine=engine)
+        except Exception:
+            logger.exception("add_keyword_trigger_rules_failed")
+
+        return {"ok": True, "id": row[0], "keyword": kw.lower()}
     except Exception as e:
         logger.exception("add_keyword_failed")
         raise HTTPException(status_code=500, detail=str(e))

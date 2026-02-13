@@ -445,3 +445,33 @@ class TestAlertHelpers:
 
         alert = _make_alert("HIGH_PRIORITY_EVENT", "Test", 80, related_event_id="abc123")
         assert alert["related_event_id"] == "abc123"
+
+    def test_keyword_pattern_avoids_substring_false_positive(self):
+        from shared.data.alert_rules import _compile_keyword_pattern
+
+        pat = _compile_keyword_pattern("ai")
+        assert pat.search("AI demand is rising")
+        assert not pat.search("the company said guidance was unchanged")
+
+    def test_keyword_pattern_matches_multi_word_phrase(self):
+        from shared.data.alert_rules import _compile_keyword_pattern
+
+        pat = _compile_keyword_pattern("rate cut")
+        assert pat.search("Markets price a rate cut in June")
+        assert pat.search("Markets price a rate   cut in June")
+
+    def test_coerce_utc_datetime_handles_iso_z(self):
+        from shared.data.alert_rules import _coerce_utc_datetime
+
+        dt = _coerce_utc_datetime("2026-02-13T01:23:45Z")
+        assert dt is not None
+        assert dt.tzinfo is not None
+        assert dt.year == 2026
+
+    def test_coerce_utc_datetime_handles_naive_datetime(self):
+        from shared.data.alert_rules import _coerce_utc_datetime
+
+        dt = _coerce_utc_datetime(datetime(2026, 2, 13, 1, 2, 3))
+        assert dt is not None
+        assert dt.tzinfo is not None
+        assert dt.utcoffset() == timezone.utc.utcoffset(dt)

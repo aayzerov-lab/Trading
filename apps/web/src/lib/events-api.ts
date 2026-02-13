@@ -9,6 +9,7 @@ import { API_URL } from './api';
 export type EventType = 'SEC_FILING' | 'MACRO_SCHEDULE' | 'RSS_NEWS' | 'OTHER';
 export type EventStatus = 'NEW' | 'ACKED' | 'DISMISSED';
 export type AlertStatus = 'NEW' | 'READ' | 'SNOOZED' | 'DISMISSED';
+export type AlertScope = 'active' | 'all' | 'archived';
 
 export interface Event {
   id: string;
@@ -116,8 +117,13 @@ export async function fetchEventStats(): Promise<EventStats> {
   return res.json();
 }
 
-export async function fetchAlerts(status?: AlertStatus, limit: number = 50): Promise<Alert[]> {
+export async function fetchAlerts(
+  status?: AlertStatus,
+  limit: number = 50,
+  scope: AlertScope = 'active'
+): Promise<Alert[]> {
   const sp = new URLSearchParams();
+  sp.set('scope', scope);
   if (status) sp.set('status', status);
   sp.set('limit', String(limit));
   const qs = sp.toString();

@@ -106,6 +106,22 @@ async def _run_event_sync_loop() -> None:
 _TICKER_NEWS_INTERVAL_SECONDS = 60
 
 
+async def _run_alert_maintenance(engine) -> None:
+    """Evaluate alert rules and clean up expired snoozes (best-effort)."""
+    try:
+        from shared.data.alert_rules import cleanup_expired_snoozes, run_alert_rules
+
+        stats = await run_alert_rules(engine=engine)
+        cleared = await cleanup_expired_snoozes(engine=engine)
+        logger.debug(
+            "alert_maintenance_completed",
+            alerts_created=stats.get("alerts_created", 0),
+            snoozes_cleared=cleared,
+        )
+    except Exception:
+        logger.exception("alert_maintenance_failed")
+
+
 async def _run_ticker_news_loop() -> None:
     """Background task to poll per-ticker Google News RSS every 60 seconds.
 
@@ -130,6 +146,7 @@ async def _run_ticker_news_loop() -> None:
             if 6 <= now_et.hour < 20:
                 engine = get_shared_engine()
                 await sync_ticker_news_feeds(engine=engine)
+                await _run_alert_maintenance(engine)
             else:
                 logger.debug("ticker_news_loop_skipped_outside_hours", hour_et=now_et.hour)
 

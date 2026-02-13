@@ -15,7 +15,10 @@ Rules
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -76,19 +79,50 @@ async def _table_exists(conn, table_name: str) -> bool:
     return bool(row)
 
 
+def _compile_keyword_pattern(keyword: str) -> re.Pattern[str]:
+    """Compile a boundary-aware, case-insensitive matcher for one keyword.
+
+    Examples:
+    - ``ai`` matches ``AI`` but not ``said``
+    - ``rate cut`` matches ``rate  cut`` with variable whitespace
+    """
+    norm = " ".join(keyword.strip().split())
+    escaped = re.escape(norm).replace(r"\ ", r"\s+")
+    return re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
+
+
+def _coerce_utc_datetime(value: Any) -> datetime | None:
+    """Best-effort conversion to timezone-aware UTC datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Rule 1: Keyword match alerts
 # ---------------------------------------------------------------------------
 
 
-async def _check_keyword_matches(engine: AsyncEngine) -> list[dict]:
-    """Create alerts for events whose title or snippet matches a user keyword.
+async def _check_keyword_matches(
+    engine: AsyncEngine,
+    max_alerts: int = 20,
+    lookback_hours: int = 24,
+) -> list[dict]:
+    """Create alerts for RSS news events whose text matches a user keyword.
 
-    Reads enabled keywords from the ``keyword_watchlist`` table and scans
-    recent NEW events for case-insensitive substring matches.
-
-    Deduplication: skip events that already have a matching KEYWORD_MATCH alert
-    (``related_event_id``).
+    Flood-control behavior:
+    - only ``RSS_NEWS`` events (no SEC/macro/risk alerts)
+    - skip per-ticker Google News fan-out feeds (``source_name LIKE 'Google News:%'``)
+    - only match events newer than the keyword's ``created_at_utc``
+    - cap alerts emitted per run
     """
     alerts: list[dict] = []
 
@@ -101,19 +135,38 @@ async def _check_keyword_matches(engine: AsyncEngine) -> list[dict]:
 
             # Fetch enabled keywords
             kw_result = await conn.execute(
-                text("SELECT keyword FROM keyword_watchlist WHERE enabled = 1")
+                text(
+                    "SELECT keyword, created_at_utc "
+                    "FROM keyword_watchlist "
+                    "WHERE enabled = 1"
+                )
             )
-            keywords = [str(r[0]).strip().lower() for r in kw_result if r[0]]
+            keyword_rows = [
+                {
+                    "keyword": str(r[0]).strip().lower(),
+                    "created_at_utc": _coerce_utc_datetime(r[1]),
+                }
+                for r in kw_result
+                if r[0]
+            ]
+            keyword_patterns = [
+                (row["keyword"], row["created_at_utc"], _compile_keyword_pattern(row["keyword"]))
+                for row in keyword_rows
+                if row["keyword"]
+            ]
 
-            if not keywords:
+            if not keyword_patterns:
                 return alerts
 
-            # Fetch recent NEW events (last 24 hours)
-            cutoff = _utcnow() - timedelta(hours=24)
+            # Fetch recent NEW RSS events (last N hours), excluding the
+            # high-volume per-ticker Google News feed fan-out.
+            cutoff = _utcnow() - timedelta(hours=lookback_hours)
             stmt = text("""
-                SELECT e.id, e.title, e.raw_text_snippet, e.severity_score
+                SELECT e.id, e.title, e.raw_text_snippet, e.severity_score, e.ts_utc
                 FROM events e
                 WHERE e.status = 'NEW'
+                  AND e.type = 'RSS_NEWS'
+                  AND COALESCE(e.source_name, '') NOT LIKE 'Google News:%'
                   AND e.ts_utc >= :cutoff
                   AND NOT EXISTS (
                       SELECT 1 FROM alerts a
@@ -121,20 +174,34 @@ async def _check_keyword_matches(engine: AsyncEngine) -> list[dict]:
                         AND a.type = 'KEYWORD_MATCH'
                   )
                 ORDER BY e.ts_utc DESC
+                LIMIT 500
             """)
             result = await conn.execute(stmt, {"cutoff": cutoff})
             rows = result.mappings().all()
 
             for row in rows:
+                if len(alerts) >= max_alerts:
+                    logger.info("alert_rules_keyword_capped", cap=max_alerts, considered=len(rows))
+                    break
+
                 title = str(row["title"] or "").lower()
                 snippet = str(row["raw_text_snippet"] or "").lower()
                 search_text = f"{title} {snippet}"
+                event_ts = _coerce_utc_datetime(row.get("ts_utc"))
 
-                matched = [kw for kw in keywords if kw in search_text]
+                matched = [
+                    kw for kw, kw_created, pattern in keyword_patterns
+                    if (
+                        kw_created is None
+                        or event_ts is None
+                        or event_ts >= kw_created
+                    )
+                    if pattern.search(search_text)
+                ]
                 if matched:
                     display_title = str(row["title"] or "Unknown event")
                     kw_display = ", ".join(matched[:3])
-                    severity = max(int(row["severity_score"] or 50), 70)
+                    severity = max(int(row["severity_score"] or 50), 65)
                     alerts.append(
                         _make_alert(
                             alert_type="KEYWORD_MATCH",
@@ -146,6 +213,128 @@ async def _check_keyword_matches(engine: AsyncEngine) -> list[dict]:
 
     except Exception:
         logger.error("alert_rules_keyword_match_error", exc_info=True)
+
+    return alerts
+
+
+async def _check_keyword_only_rss(
+    engine: AsyncEngine,
+    max_alerts: int = 20,
+    lookback_hours: int = 24,
+) -> list[dict]:
+    """Create keyword alerts from extra RSS feeds that are not in live tape.
+
+    This fetches ``KEYWORD_ONLY_FEEDS`` and emits KEYWORD_MATCH alerts
+    directly, without inserting those articles into the events table.
+    """
+    alerts: list[dict] = []
+
+    try:
+        from .rss_feeds import KEYWORD_ONLY_FEEDS, _fetch_feed, _parse_rss_date
+    except Exception:
+        logger.warning("alert_rules_keyword_only_import_failed", exc_info=True)
+        return alerts
+
+    if not KEYWORD_ONLY_FEEDS:
+        return alerts
+
+    try:
+        async with engine.connect() as conn:
+            for tbl in ("alerts", "keyword_watchlist"):
+                if not await _table_exists(conn, tbl):
+                    logger.debug("alert_rules_skip_keyword_only", reason=f"{tbl} table missing")
+                    return alerts
+
+            kw_result = await conn.execute(
+                text(
+                    "SELECT keyword, created_at_utc "
+                    "FROM keyword_watchlist "
+                    "WHERE enabled = 1"
+                )
+            )
+            keyword_rows = [
+                {
+                    "keyword": str(r[0]).strip().lower(),
+                    "created_at_utc": _coerce_utc_datetime(r[1]),
+                }
+                for r in kw_result
+                if r[0]
+            ]
+            keyword_patterns = [
+                (row["keyword"], row["created_at_utc"], _compile_keyword_pattern(row["keyword"]))
+                for row in keyword_rows
+                if row["keyword"]
+            ]
+
+            if not keyword_patterns:
+                return alerts
+
+        cutoff = _utcnow() - timedelta(hours=lookback_hours)
+        feed_results = await asyncio.gather(
+            *[_fetch_feed(feed) for feed in KEYWORD_ONLY_FEEDS],
+            return_exceptions=True,
+        )
+
+        for feed, result in zip(KEYWORD_ONLY_FEEDS, feed_results):
+            if len(alerts) >= max_alerts:
+                logger.info("alert_rules_keyword_only_capped", cap=max_alerts)
+                break
+
+            if isinstance(result, Exception):
+                logger.warning(
+                    "alert_rules_keyword_only_feed_failed",
+                    feed=feed.get("name", "unknown"),
+                    error=str(result),
+                )
+                continue
+
+            feed_name = str(feed.get("name", "RSS"))
+            base_severity = int(feed.get("base_severity", 50))
+
+            for article in result:
+                if len(alerts) >= max_alerts:
+                    logger.info("alert_rules_keyword_only_capped", cap=max_alerts)
+                    break
+
+                title = str(article.get("title") or "").strip()
+                if not title:
+                    continue
+
+                pub_date = _parse_rss_date(str(article.get("published") or ""))
+                if pub_date is not None and pub_date < cutoff:
+                    continue
+
+                description = str(article.get("description") or "")
+                search_text = f"{title} {description}".lower()
+
+                matched = [
+                    kw for kw, kw_created, pattern in keyword_patterns
+                    if (
+                        kw_created is None
+                        or pub_date is None
+                        or pub_date >= kw_created
+                    )
+                    if pattern.search(search_text)
+                ]
+                if not matched:
+                    continue
+
+                link = str(article.get("link") or "")
+                dedup_input = f"kwrss:{feed_name}:{link or title}:{'|'.join(sorted(matched))}"
+                dedup_id = "kwrss:" + hashlib.sha256(dedup_input.encode("utf-8")).hexdigest()
+                kw_display = ", ".join(matched[:3])
+                severity = max(base_severity, 65)
+                alerts.append(
+                    _make_alert(
+                        alert_type="KEYWORD_MATCH",
+                        message=f"Keyword [{kw_display}] ({feed_name}): {title}",
+                        severity=severity,
+                        related_event_id=dedup_id,
+                    )
+                )
+
+    except Exception:
+        logger.error("alert_rules_keyword_only_error", exc_info=True)
 
     return alerts
 
@@ -497,14 +686,15 @@ async def _insert_alerts(
             :ts_utc, :type, :message, :severity,
             :related_event_id, :status, :snoozed_until
         )
+        ON CONFLICT DO NOTHING
     """)
 
     inserted = 0
     try:
         async with engine.begin() as conn:
             for alert in alerts:
-                await conn.execute(stmt, alert)
-                inserted += 1
+                result = await conn.execute(stmt, alert)
+                inserted += int(result.rowcount or 0)
     except Exception:
         logger.error(
             "alert_rules_insert_error",
@@ -547,13 +737,17 @@ async def run_alert_rules(
     try:
         rules_evaluated += 1
         keyword_matches = await _check_keyword_matches(engine)
-        all_alerts.extend(keyword_matches)
-        if keyword_matches:
-            by_type["KEYWORD_MATCH"] = len(keyword_matches)
+        keyword_only_matches = await _check_keyword_only_rss(engine)
+        keyword_total = keyword_matches + keyword_only_matches
+        all_alerts.extend(keyword_total)
+        if keyword_total:
+            by_type["KEYWORD_MATCH"] = len(keyword_total)
         logger.debug(
             "alert_rule_evaluated",
             rule="KEYWORD_MATCH",
-            new_alerts=len(keyword_matches),
+            new_alerts=len(keyword_total),
+            events_alerts=len(keyword_matches),
+            keyword_only_alerts=len(keyword_only_matches),
         )
     except Exception:
         logger.error("alert_rule_failed", rule="KEYWORD_MATCH", exc_info=True)
