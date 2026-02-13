@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert, AlertStatus, Keyword, fetchAlerts, fetchUnreadAlertCount, updateAlertStatus,
-  fetchKeywords, addKeyword, deleteKeyword,
+  fetchKeywords, addKeyword, deleteKeyword, markAllAlertsRead,
 } from "@/lib/events-api";
 
 function timeAgo(iso: string): string {
@@ -113,6 +113,7 @@ const S: Record<string, React.CSSProperties> = {
 };
 
 type Tab = "alerts" | "keywords";
+const KEYWORD_ALERT_TYPE = "KEYWORD_MATCH";
 
 export default function NotificationCenter() {
   const [unreadCount, setUnreadCount] = useState(0);
@@ -129,7 +130,7 @@ export default function NotificationCenter() {
 
   const refreshUnreadCount = useCallback(async () => {
     try {
-      setUnreadCount(await fetchUnreadAlertCount());
+      setUnreadCount(await fetchUnreadAlertCount(KEYWORD_ALERT_TYPE));
       setUnreadError(null);
     } catch {
       setUnreadError("Failed to refresh unread count");
@@ -139,7 +140,7 @@ export default function NotificationCenter() {
   const loadAlerts = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await fetchAlerts(undefined, 50, "active");
+      const data = await fetchAlerts(undefined, 50, "active", KEYWORD_ALERT_TYPE);
       data.sort((a, b) => new Date(b.ts_utc).getTime() - new Date(a.ts_utc).getTime());
       setAlerts(data);
       setAlertsError(null);
@@ -206,17 +207,15 @@ export default function NotificationCenter() {
   }, [refreshUnreadCount]);
 
   const handleMarkAllRead = useCallback(async () => {
-    const unread = alerts.filter((a) => a.status === "NEW");
-    if (unread.length === 0) return;
     try {
-      await Promise.all(unread.map((a) => updateAlertStatus(a.id, "READ")));
+      await markAllAlertsRead(KEYWORD_ALERT_TYPE);
       setAlerts((prev) => prev.filter((a) => a.status !== "NEW"));
       setAlertsError(null);
       await refreshUnreadCount();
     } catch {
       setAlertsError("Failed to mark all as read");
     }
-  }, [alerts, refreshUnreadCount]);
+  }, [refreshUnreadCount]);
 
   const handleAddKeyword = useCallback(async () => {
     const kw = newKw.trim();
@@ -305,6 +304,18 @@ export default function NotificationCenter() {
                     <div style={S.body as React.CSSProperties}>
                       <div style={S.msg as React.CSSProperties}>{a.message}</div>
                       <div style={S.time}>{timeAgo(a.ts_utc)}</div>
+                      {a.source_url && (
+                        <div style={S.time}>
+                          <a
+                            href={a.source_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ color: "var(--accent)" }}
+                          >
+                            Open source
+                          </a>
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div style={S.actions as React.CSSProperties}>

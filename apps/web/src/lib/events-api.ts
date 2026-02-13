@@ -35,6 +35,7 @@ export interface Alert {
   ts_utc: string;
   type: string;
   message: string;
+  source_url: string | null;
   severity: number;
   related_event_id: string | null;
   status: AlertStatus;
@@ -120,11 +121,13 @@ export async function fetchEventStats(): Promise<EventStats> {
 export async function fetchAlerts(
   status?: AlertStatus,
   limit: number = 50,
-  scope: AlertScope = 'active'
+  scope: AlertScope = 'active',
+  alertType?: string
 ): Promise<Alert[]> {
   const sp = new URLSearchParams();
   sp.set('scope', scope);
   if (status) sp.set('status', status);
+  if (alertType) sp.set('type', alertType);
   sp.set('limit', String(limit));
   const qs = sp.toString();
   const res = await fetch(`${API_URL}/events/alerts${qs ? '?' + qs : ''}`);
@@ -134,8 +137,11 @@ export async function fetchAlerts(
   return res.json();
 }
 
-export async function fetchUnreadAlertCount(): Promise<number> {
-  const res = await fetch(`${API_URL}/events/alerts/unread-count`);
+export async function fetchUnreadAlertCount(alertType?: string): Promise<number> {
+  const sp = new URLSearchParams();
+  if (alertType) sp.set('type', alertType);
+  const qs = sp.toString();
+  const res = await fetch(`${API_URL}/events/alerts/unread-count${qs ? '?' + qs : ''}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch unread alert count: ${res.status} ${res.statusText}`);
   }
@@ -160,6 +166,19 @@ export async function updateAlertStatus(
   if (!res.ok) {
     throw new Error(`Failed to update alert status: ${res.status} ${res.statusText}`);
   }
+}
+
+export async function markAllAlertsRead(alertType?: string): Promise<{ ok: boolean; updated: number }> {
+  const sp = new URLSearchParams();
+  if (alertType) sp.set('type', alertType);
+  const qs = sp.toString();
+  const res = await fetch(`${API_URL}/events/alerts/mark-all-read${qs ? '?' + qs : ''}`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to mark all alerts read: ${res.status} ${res.statusText}`);
+  }
+  return res.json();
 }
 
 export async function seedEvents(): Promise<{ seeded: boolean; events: number; alerts: number }> {

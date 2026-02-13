@@ -113,6 +113,10 @@ async def _run_phase1_migrations(engine: AsyncEngine) -> None:
             "ALTER TABLE events ADD COLUMN IF NOT EXISTS "
             "scheduled_for_utc TIMESTAMPTZ"
         ))
+        await conn.execute(text(
+            "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS "
+            "source_url TEXT"
+        ))
         # Backfill: for MACRO_SCHEDULE events, copy ts_utc → scheduled_for_utc
         await conn.execute(text(
             "UPDATE events SET scheduled_for_utc = ts_utc "
@@ -135,13 +139,56 @@ async def _run_phase1_migrations(engine: AsyncEngine) -> None:
             "CREATE INDEX IF NOT EXISTS idx_events_type_status "
             "ON events (type, status)"
         ))
+
+        # Legacy cleanup:
+        # 1) Deduplicate alerts by (type, related_event_id) so unique index creation can succeed.
+        # 2) Archive legacy Google News keyword alerts from earlier noisy behavior.
+        # 3) Deduplicate keyword watchlist case-insensitively.
         await conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_alerts_type_related_event "
-            "ON alerts (type, related_event_id) "
-            "WHERE related_event_id IS NOT NULL"
+            """
+            DELETE FROM alerts a
+            USING alerts b
+            WHERE a.id < b.id
+              AND a.type = b.type
+              AND a.related_event_id = b.related_event_id
+              AND a.related_event_id IS NOT NULL
+            """
         ))
         await conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_keyword_watchlist_keyword_lower "
-            "ON keyword_watchlist (LOWER(keyword))"
+            """
+            UPDATE alerts a
+            SET status = 'READ', snoozed_until = NULL
+            FROM events e
+            WHERE a.related_event_id = e.id
+              AND a.type = 'KEYWORD_MATCH'
+              AND a.status = 'NEW'
+              AND COALESCE(e.source_name, '') LIKE 'Google News:%'
+            """
         ))
+        await conn.execute(text(
+            """
+            DELETE FROM keyword_watchlist k1
+            USING keyword_watchlist k2
+            WHERE k1.id < k2.id
+              AND LOWER(k1.keyword) = LOWER(k2.keyword)
+            """
+        ))
+
+        # Indexes are best-effort to avoid blocking startup if legacy data is malformed.
+        try:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_alerts_type_related_event "
+                "ON alerts (type, related_event_id) "
+                "WHERE related_event_id IS NOT NULL"
+            ))
+        except Exception:
+            logger.warning("alerts_unique_index_create_failed", exc_info=True)
+
+        try:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_keyword_watchlist_keyword_lower "
+                "ON keyword_watchlist (LOWER(keyword))"
+            ))
+        except Exception:
+            logger.warning("keyword_unique_index_create_failed", exc_info=True)
     logger.info("phase1_migrations_applied")

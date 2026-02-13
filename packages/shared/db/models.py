@@ -202,6 +202,7 @@ alerts = Table(
     Column("ts_utc", DateTime(timezone=True), nullable=False),
     Column("type", String, nullable=False),
     Column("message", Text, nullable=False),
+    Column("source_url", Text, nullable=True),
     Column("severity", Integer, server_default=text("50")),
     Column("related_event_id", String, nullable=True),
     Column("status", String, nullable=False, server_default=text("'NEW'")),

@@ -335,19 +335,20 @@ async def list_alerts(
         description="Alert scope: active (NEW,SNOOZED), archived (READ,DISMISSED), or all",
     ),
     status: Optional[str] = Query(default=None, description="Filter by alert status"),
+    alert_type: Optional[str] = Query(default=None, alias="type", description="Filter by alert type"),
     limit: int = Query(default=50, ge=1, le=500, description="Max alerts to return"),
 ) -> list[dict[str, Any]]:
     """Return alerts with optional status filter, ordered by newest first."""
     try:
-        logger.info("list_alerts_request", scope=scope, status=status, limit=limit)
+        logger.info("list_alerts_request", scope=scope, status=status, type=alert_type, limit=limit)
 
         params: dict[str, Any] = {"limit": limit}
         where_parts: list[str] = []
 
         if scope == "active":
-            where_parts.append("status IN ('NEW', 'SNOOZED')")
+            where_parts.append("a.status IN ('NEW', 'SNOOZED')")
         elif scope == "archived":
-            where_parts.append("status IN ('READ', 'DISMISSED')")
+            where_parts.append("a.status IN ('READ', 'DISMISSED')")
 
         if status is not None:
             if status not in _VALID_ALERT_STATUSES:
@@ -355,17 +356,22 @@ async def list_alerts(
                     status_code=400,
                     detail=f"Invalid status: {status}. Must be one of {sorted(_VALID_ALERT_STATUSES)}",
                 )
-            where_parts.append("status = :status")
+            where_parts.append("a.status = :status")
             params["status"] = status
+
+        if alert_type is not None:
+            where_parts.append("a.type = :alert_type")
+            params["alert_type"] = alert_type
 
         where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
         query = f"""
-            SELECT id, ts_utc, type, message, severity, related_event_id,
-                   status, snoozed_until, created_at_utc
-            FROM alerts
+            SELECT a.id, a.ts_utc, a.type, a.message, COALESCE(a.source_url, e.source_url) AS source_url,
+                   a.severity, a.related_event_id, a.status, a.snoozed_until, a.created_at_utc
+            FROM alerts a
+            LEFT JOIN events e ON e.id = a.related_event_id
             {where}
-            ORDER BY created_at_utc DESC
+            ORDER BY a.created_at_utc DESC
             LIMIT :limit
         """
 
@@ -388,15 +394,23 @@ async def list_alerts(
 
 
 @_alerts_router.get("/unread-count")
-async def alerts_unread_count() -> dict[str, int]:
+async def alerts_unread_count(
+    alert_type: Optional[str] = Query(default=None, alias="type", description="Filter by alert type"),
+) -> dict[str, int]:
     """Return the number of alerts with status NEW."""
     try:
-        logger.info("alerts_unread_count_request")
+        logger.info("alerts_unread_count_request", type=alert_type)
 
+        params: dict[str, Any] = {}
+        where_parts = ["status = 'NEW'"]
+        if alert_type is not None:
+            where_parts.append("type = :alert_type")
+            params["alert_type"] = alert_type
         engine = get_shared_engine()
         async with engine.connect() as conn:
             result = await conn.execute(
-                text("SELECT COUNT(*) AS cnt FROM alerts WHERE status = 'NEW'")
+                text(f"SELECT COUNT(*) AS cnt FROM alerts WHERE {' AND '.join(where_parts)}"),
+                params,
             )
             count = result.scalar() or 0
 
@@ -413,6 +427,42 @@ async def alerts_unread_count() -> dict[str, int]:
 # ---------------------------------------------------------------------------
 # 7. PATCH /alerts/{alert_id}/status – Update alert status
 # ---------------------------------------------------------------------------
+
+
+@_alerts_router.post("/mark-all-read")
+async def mark_all_alerts_read(
+    alert_type: Optional[str] = Query(default=None, alias="type", description="Filter by alert type"),
+) -> dict[str, Any]:
+    """Mark every unread alert (status NEW) as READ."""
+    try:
+        logger.info("mark_all_alerts_read_request", type=alert_type)
+
+        params: dict[str, Any] = {}
+        where = "status = 'NEW'"
+        if alert_type is not None:
+            where += " AND type = :alert_type"
+            params["alert_type"] = alert_type
+        query = f"""
+            UPDATE alerts
+            SET status = 'READ', snoozed_until = NULL
+            WHERE {where}
+        """
+        engine = get_shared_engine()
+        async with engine.begin() as conn:
+            result = await conn.execute(
+                text(query),
+                params,
+            )
+            updated = int(result.rowcount or 0)
+
+        return {"ok": True, "updated": updated}
+
+    except Exception as e:
+        logger.exception("mark_all_alerts_read_failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to mark all alerts as read: {str(e)}",
+        )
 
 
 @_alerts_router.patch("/{alert_id}/status")

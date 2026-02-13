@@ -51,12 +51,14 @@ def _make_alert(
     message: str,
     severity: int,
     related_event_id: str | None = None,
+    source_url: str | None = None,
 ) -> dict[str, Any]:
     """Build an alert dict ready for insertion into the ``alerts`` table."""
     return {
         "ts_utc": _utcnow(),
         "type": alert_type,
         "message": message[:300],
+        "source_url": (source_url or "")[:2000] or None,
         "severity": max(0, min(severity, 100)),
         "related_event_id": related_event_id,
         "status": "NEW",
@@ -162,7 +164,7 @@ async def _check_keyword_matches(
             # high-volume per-ticker Google News feed fan-out.
             cutoff = _utcnow() - timedelta(hours=lookback_hours)
             stmt = text("""
-                SELECT e.id, e.title, e.raw_text_snippet, e.severity_score, e.ts_utc
+                SELECT e.id, e.title, e.raw_text_snippet, e.severity_score, e.ts_utc, e.source_url
                 FROM events e
                 WHERE e.status = 'NEW'
                   AND e.type = 'RSS_NEWS'
@@ -208,6 +210,7 @@ async def _check_keyword_matches(
                             message=f"Keyword [{kw_display}]: {display_title}",
                             severity=severity,
                             related_event_id=str(row["id"]),
+                            source_url=str(row["source_url"] or "") or None,
                         )
                     )
 
@@ -269,6 +272,20 @@ async def _check_keyword_only_rss(
             if not keyword_patterns:
                 return alerts
 
+            # Preload existing keyword-only dedupe IDs so we don't rely solely
+            # on DB unique indexes for idempotency.
+            existing_result = await conn.execute(
+                text(
+                    """
+                    SELECT related_event_id
+                    FROM alerts
+                    WHERE type = 'KEYWORD_MATCH'
+                      AND related_event_id LIKE 'kwrss:%'
+                    """
+                )
+            )
+            existing_kwrss_ids = {str(r[0]) for r in existing_result if r[0]}
+
         cutoff = _utcnow() - timedelta(hours=lookback_hours)
         feed_results = await asyncio.gather(
             *[_fetch_feed(feed) for feed in KEYWORD_ONLY_FEEDS],
@@ -322,6 +339,8 @@ async def _check_keyword_only_rss(
                 link = str(article.get("link") or "")
                 dedup_input = f"kwrss:{feed_name}:{link or title}:{'|'.join(sorted(matched))}"
                 dedup_id = "kwrss:" + hashlib.sha256(dedup_input.encode("utf-8")).hexdigest()
+                if dedup_id in existing_kwrss_ids:
+                    continue
                 kw_display = ", ".join(matched[:3])
                 severity = max(base_severity, 65)
                 alerts.append(
@@ -330,8 +349,10 @@ async def _check_keyword_only_rss(
                         message=f"Keyword [{kw_display}] ({feed_name}): {title}",
                         severity=severity,
                         related_event_id=dedup_id,
+                        source_url=link or None,
                     )
                 )
+                existing_kwrss_ids.add(dedup_id)
 
     except Exception:
         logger.error("alert_rules_keyword_only_error", exc_info=True)
@@ -680,10 +701,10 @@ async def _insert_alerts(
 
     stmt = text("""
         INSERT INTO alerts (
-            ts_utc, type, message, severity,
+            ts_utc, type, message, source_url, severity,
             related_event_id, status, snoozed_until
         ) VALUES (
-            :ts_utc, :type, :message, :severity,
+            :ts_utc, :type, :message, :source_url, :severity,
             :related_event_id, :status, :snoozed_until
         )
         ON CONFLICT DO NOTHING
