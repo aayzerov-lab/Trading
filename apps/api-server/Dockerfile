@@ -20,4 +20,4 @@ COPY apps/api-server/ /app/apps/api-server/
 # Set PYTHONPATH so imports resolve correctly
 ENV PYTHONPATH="/app/apps/api-server:/app/packages"
 
-CMD ["uvicorn", "api_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn api_server.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

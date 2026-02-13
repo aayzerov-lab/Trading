@@ -288,9 +288,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception:
         logger.exception("phase1_db_init_failed")
 
-    _redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    await _redis.ping()
-    logger.info("redis_connected", url=settings.REDIS_URL)
+    if settings.REDIS_URL:
+        _redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        await _redis.ping()
+        logger.info("redis_connected", url=settings.REDIS_URL)
+    else:
+        logger.info("redis_skipped", reason="REDIS_URL not configured")
 
     # Start background scheduler for daily data updates
     _scheduler_task = asyncio.create_task(_run_scheduler())

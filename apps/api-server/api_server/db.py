@@ -6,6 +6,7 @@ positions tables that are owned and written to by the broker-bridge service.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import structlog
@@ -41,13 +42,15 @@ async def get_engine(postgres_url: str) -> AsyncEngine:
     global _engine
     if _engine is None:
         url = _make_async_url(postgres_url)
-        _engine = create_async_engine(
-            url,
+        kwargs: dict[str, Any] = dict(
             pool_size=5,
             max_overflow=10,
             pool_pre_ping=True,
             pool_recycle=3600,
         )
+        if os.environ.get("DB_SSL", "").lower() in ("1", "true", "yes"):
+            kwargs["connect_args"] = {"ssl": "require"}
+        _engine = create_async_engine(url, **kwargs)
         logger.info("database_engine_created")
     return _engine
 
@@ -132,7 +135,7 @@ _DAILY_PNL_NLV_ALL = text("""
          WHERE tag = 'DailyPnL' AND account != 'All'
          ORDER BY updated_at DESC LIMIT 1) AS daily_pnl,
         (SELECT SUM(daily_pnl) FROM positions_current
-         WHERE daily_pnl IS NOT NULL) AS daily_pnl_positions
+         WHERE daily_pnl IS NOT NULL AND daily_pnl < 1e9 AND daily_pnl > -1e9) AS daily_pnl_positions
 """)
 
 _DAILY_PNL_NLV_BY_ACCOUNT = text("""
@@ -144,7 +147,7 @@ _DAILY_PNL_NLV_BY_ACCOUNT = text("""
          WHERE tag = 'DailyPnL' AND account = :account
          ORDER BY updated_at DESC LIMIT 1) AS daily_pnl,
         (SELECT SUM(daily_pnl) FROM positions_current
-         WHERE daily_pnl IS NOT NULL AND account = :account) AS daily_pnl_positions
+         WHERE daily_pnl IS NOT NULL AND daily_pnl < 1e9 AND daily_pnl > -1e9 AND account = :account) AS daily_pnl_positions
 """)
 
 

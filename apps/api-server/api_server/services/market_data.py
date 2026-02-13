@@ -862,7 +862,7 @@ async def fetch_price_context(
     if not sections:
         return None
 
-    header = "**MARKET DATA (Yahoo Finance):**\n"
+    header = "**MARKET DATA (Yahoo Finance — regular trading session only, excludes after-hours/pre-market):**\n"
     return header + "\n".join(sections)
 
 

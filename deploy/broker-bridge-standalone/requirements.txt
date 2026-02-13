@@ -1,0 +1,9 @@
+ib_insync
+asyncpg
+sqlalchemy[asyncio]
+redis[hiredis]
+pydantic
+pydantic-settings
+structlog
+greenlet
+tzdata

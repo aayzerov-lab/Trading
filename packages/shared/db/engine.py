@@ -63,13 +63,15 @@ def get_shared_engine(postgres_url: str | None = None) -> AsyncEngine:
         )
 
     url = _make_async_url(postgres_url)
-    _shared_engine = create_async_engine(
-        url,
+    kwargs: dict = dict(
         pool_size=5,
         max_overflow=10,
         pool_pre_ping=True,
         pool_recycle=3600,
     )
+    if os.environ.get("DB_SSL", "").lower() in ("1", "true", "yes"):
+        kwargs["connect_args"] = {"ssl": "require"}
+    _shared_engine = create_async_engine(url, **kwargs)
     logger.info("shared_engine_created")
     return _shared_engine
 

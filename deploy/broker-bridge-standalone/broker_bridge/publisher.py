@@ -19,10 +19,7 @@ class RedisPublisher:
         self._redis: aioredis.Redis | None = None
 
     async def connect(self) -> None:
-        """Open the Redis connection (no-op if URL is empty)."""
-        if not self._redis_url:
-            logger.info("redis_skipped", reason="REDIS_URL not configured")
-            return
+        """Open the Redis connection."""
         self._redis = aioredis.from_url(
             self._redis_url,
             decode_responses=True,
@@ -34,7 +31,7 @@ class RedisPublisher:
     async def publish(self, channel: str, data: dict[str, Any]) -> None:
         """Serialise *data* to JSON and publish on *channel*."""
         if self._redis is None:
-            return
+            raise RuntimeError("RedisPublisher is not connected. Call connect() first.")
         payload = json.dumps(data, default=str)
         await self._redis.publish(channel, payload)
         logger.debug("redis_published", channel=channel)

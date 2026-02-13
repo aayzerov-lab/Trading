@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     """
 
     POSTGRES_URL: str
-    REDIS_URL: str
+    REDIS_URL: str = ""
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
     FRED_API_KEY: str = ""  # Optional, needed for FRED data fetching

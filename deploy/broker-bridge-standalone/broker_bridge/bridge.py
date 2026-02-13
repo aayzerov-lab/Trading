@@ -333,7 +333,7 @@ class IBBridge:
         daily_pnl_map: dict[int, float | None] = {}
         try:
             for ps in self._ib.pnlSingle():
-                if ps.conId and ps.dailyPnL is not None and ps.dailyPnL == ps.dailyPnL and abs(ps.dailyPnL) < 1e9:
+                if ps.conId and ps.dailyPnL is not None and ps.dailyPnL == ps.dailyPnL:
                     daily_pnl_map[ps.conId] = ps.dailyPnL
         except Exception:
             logger.debug("pnl_single_read_failed")
@@ -341,7 +341,7 @@ class IBBridge:
         # Subscribe to account-level PnL and upsert DailyPnL tag
         try:
             for pnl_obj in self._ib.pnl():
-                if pnl_obj.dailyPnL is not None and pnl_obj.dailyPnL == pnl_obj.dailyPnL and abs(pnl_obj.dailyPnL) < 1e9:
+                if pnl_obj.dailyPnL is not None and pnl_obj.dailyPnL == pnl_obj.dailyPnL:
                     loop.create_task(
                         self._upsert_account_summary_safe(
                             account=pnl_obj.account,
