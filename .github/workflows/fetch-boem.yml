@@ -2,8 +2,6 @@ name: Fetch BOEM raw data
 
 on:
   push:
-    paths:
-      - '.github/workflows/fetch-boem.yml'
   workflow_dispatch:
 
 permissions:
@@ -11,6 +9,7 @@ permissions:
 
 jobs:
   fetch:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
