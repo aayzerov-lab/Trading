@@ -1,0 +1,2 @@
+116e113294444348feedfc1a1291c330affae95493f3b98e542e4a673a409b02  boem_downloads/PlatStrucRawData.zip
+9af61b2a836f80466c83f3cda7e14995ce2b5adebf1910831213db65de48938f  boem_downloads/ProdByPlatformRawData.zip
