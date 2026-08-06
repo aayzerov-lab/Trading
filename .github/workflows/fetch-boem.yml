@@ -1,0 +1,39 @@
+name: Fetch BOEM raw data
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fetch-boem.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download official BOEM/BSEE raw data
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p boem_downloads
+          curl --fail --location --retry 5 --retry-all-errors --user-agent 'Mozilla/5.0' \
+            'https://www.data.bsee.gov/Platform/Files/PlatStrucRawData.zip' \
+            --output boem_downloads/PlatStrucRawData.zip
+          curl --fail --location --retry 5 --retry-all-errors --user-agent 'Mozilla/5.0' \
+            'https://www.data.bsee.gov/Production/Files/ProdByPlatformRawData.zip' \
+            --output boem_downloads/ProdByPlatformRawData.zip
+          unzip -t boem_downloads/PlatStrucRawData.zip
+          unzip -t boem_downloads/ProdByPlatformRawData.zip
+          sha256sum boem_downloads/*.zip > boem_downloads/SHA256SUMS.txt
+      - name: Commit downloaded files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'BOEM data fetch bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add boem_downloads
+          git commit -m 'Add official BOEM raw data downloads' || exit 0
+          git push
